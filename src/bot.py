@@ -12,8 +12,15 @@ import schedule
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Mock mode - CLOB client not loaded
-CLOB_AVAILABLE = False
+# Try to import CLOB client
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds
+    CLOB_AVAILABLE = True
+    print("✅ CLOB client loaded successfully")
+except ImportError as e:
+    CLOB_AVAILABLE = False
+    print(f"⚠️ CLOB client not available: {e}")
 
 # Setup logging
 logging.basicConfig(
@@ -57,6 +64,11 @@ class LunaTradingBot:
         self.check_interval = int(os.getenv('CHECK_INTERVAL_MINUTES', 5))
         self.min_liquidity = float(os.getenv('MIN_LIQUIDITY', 10000))  # $10k min
         
+        # Initialize CLOB client if available
+        self.clob_client = None
+        if CLOB_AVAILABLE:
+            self._init_clob_client()
+        
         # Initialize
         self.init_database()
         self.load_memory()
@@ -64,6 +76,43 @@ class LunaTradingBot:
         logger.info(f"🌙 Luna Bot Initialized")
         logger.info(f"💰 Capital: ${self.current_capital:.2f} | Phase: {self.phase} ({self.PHASES[self.phase]['name']})")
         logger.info(f"🎯 Max Position: {self.PHASES[self.phase]['max_position']*100:.0f}% | Min Confidence: {self.PHASES[self.phase]['min_confidence']*100:.0f}%")
+        if self.clob_client:
+            logger.info("✅ Connected to Polymarket CLOB")
+        else:
+            logger.info("⚠️ Running in mock mode (no CLOB connection)")
+
+    def _init_clob_client(self):
+        """Initialize Polymarket CLOB client"""
+        try:
+            private_key = os.getenv('POLY_PRIVATE_KEY')
+            if not private_key:
+                logger.warning("POLY_PRIVATE_KEY not set, skipping CLOB init")
+                return
+            
+            self.clob_client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=private_key,
+                chain_id=137  # Polygon
+            )
+            
+            # Set API credentials if available
+            api_key = os.getenv('POLY_API_KEY')
+            api_secret = os.getenv('POLY_API_SECRET')
+            passphrase = os.getenv('POLY_PASSPHRASE')
+            
+            if api_key and api_secret:
+                self.clob_client.set_api_creds(ApiCreds(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=passphrase
+                ))
+                logger.info("✅ CLOB client initialized with API credentials")
+            else:
+                logger.info("⚠️ CLOB client initialized without API credentials")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize CLOB client: {e}")
+            self.clob_client = None
 
     def init_database(self):
         """Initialize SQLite for trade memory and evolution"""
