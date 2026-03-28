@@ -357,22 +357,49 @@ class LunaTradingBot:
             conn.commit()
             conn.close()
             
-            report = f"""
-📊 LUNA DAILY REPORT - {today}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Capital: ${self.current_capital:.2f} (PnL: ${pnl:+.2f}, ROI: {roi:+.2f}%)
-📈 Trades: {total or 0} | ✅ Wins: {wins} | ❌ Losses: {(total or 0) - wins}
-🎯 Win Rate: {win_rate:.1f}%
+            report = f"""📊 LUNA DAILY REPORT - {today}
+
+💰 Capital: ${self.current_capital:.2f}
+📈 PnL: ${pnl:+.2f} ({roi:+.2f}%)
+🎯 Trades: {total or 0} | ✅ Wins: {wins} | ❌ Losses: {(total or 0) - wins}
+🏆 Win Rate: {win_rate:.1f}%
 🚀 Phase: {self.phase} ({self.PHASES[self.phase]['name']})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            """
+💵 Virtual Balance: ${self.virtual_balance:.2f}
+
+Keep compounding! 🌙"""
             
             logger.info(report)
+            
+            # Send Telegram alert if configured
+            self._send_telegram_alert(report)
+            
             return report
             
         except Exception as e:
             logger.error(f"❌ Daily report failed: {e}")
             return None
+
+    def _send_telegram_alert(self, message: str):
+        """Send alert via Telegram"""
+        try:
+            import requests
+            bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            
+            if not bot_token or not chat_id:
+                return
+            
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                'chat_id': chat_id,
+                'text': message,
+                'parse_mode': 'Markdown'
+            }
+            
+            requests.post(url, json=payload, timeout=10)
+            logger.info("📱 Telegram alert sent")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to send Telegram alert: {e}")
 
     def check_markets(self):
         """Main market checking loop"""
