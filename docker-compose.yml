@@ -1,0 +1,57 @@
+# Luna Trading Bot - Docker Compose
+# Conservative Polymarket Auto Trader
+
+version: '3.8'
+
+services:
+  luna-bot:
+    build: .
+    container_name: luna-trading-bot
+    restart: unless-stopped
+    
+    # Environment variables (from .env file)
+    env_file:
+      - .env
+    
+    # Resource limits (optimized for WorkPlus/laptop)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'        # Max 50% CPU
+          memory: 512M       # Max 512MB RAM
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    # Persistence
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    # Security
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    
+    # Networks (isolated)
+    networks:
+      - luna-network
+
+networks:
+  luna-network:
+    driver: bridge
