@@ -10,8 +10,10 @@ import sqlite3
 import logging
 import schedule
 from datetime import datetime, timedelta
-from decimal import Decimal
 from dotenv import load_dotenv
+
+# Mock mode - CLOB client not loaded
+CLOB_AVAILABLE = False
 
 # Setup logging
 logging.basicConfig(

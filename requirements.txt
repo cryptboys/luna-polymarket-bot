@@ -1,19 +1,4 @@
-# Luna Trading Bot - Python Dependencies
-
-# Core
-python-dotenv>=1.0.0
-requests>=2.31.0
-schedule>=1.2.0
-
-# Web3 dependencies
-web3>=6.0.0
-eth-account>=0.8.0
-
-# Polymarket SDK
-py-clob-client
-
-# Database
-# psycopg2-binary>=2.9.0  # Only if using PostgreSQL
-
-# Utilities
-decimal>=1.0.0
+# Minimal requirements for Luna Bot
+python-dotenv
+requests
+schedule
