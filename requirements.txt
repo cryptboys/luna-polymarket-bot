@@ -10,7 +10,7 @@ web3>=6.0.0
 eth-account>=0.8.0
 
 # Polymarket SDK
-py-clob-client>=0.0.1
+py-clob-client
 
 # Database
 # psycopg2-binary>=2.9.0  # Only if using PostgreSQL
