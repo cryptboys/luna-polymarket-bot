@@ -64,9 +64,13 @@ class LunaTradingBot:
         self.check_interval = int(os.getenv('CHECK_INTERVAL_MINUTES', 5))
         self.min_liquidity = float(os.getenv('MIN_LIQUIDITY', 10000))  # $10k min
         
+        # Paper trading mode
+        self.paper_trading = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
+        self.virtual_balance = self.initial_capital if self.paper_trading else 0
+        
         # Initialize CLOB client if available
         self.clob_client = None
-        if CLOB_AVAILABLE:
+        if CLOB_AVAILABLE and not self.paper_trading:
             self._init_clob_client()
         
         # Initialize
@@ -76,8 +80,12 @@ class LunaTradingBot:
         logger.info(f"🌙 Luna Bot Initialized")
         logger.info(f"💰 Capital: ${self.current_capital:.2f} | Phase: {self.phase} ({self.PHASES[self.phase]['name']})")
         logger.info(f"🎯 Max Position: {self.PHASES[self.phase]['max_position']*100:.0f}% | Min Confidence: {self.PHASES[self.phase]['min_confidence']*100:.0f}%")
-        if self.clob_client:
-            logger.info("✅ Connected to Polymarket CLOB")
+        
+        if self.paper_trading:
+            logger.info("📊 PAPER TRADING MODE - No real money at risk")
+            logger.info(f"💵 Virtual Balance: ${self.virtual_balance:.2f}")
+        elif self.clob_client:
+            logger.info("✅ Connected to Polymarket CLOB - LIVE TRADING")
         else:
             logger.info("⚠️ Running in mock mode (no CLOB connection)")
 
