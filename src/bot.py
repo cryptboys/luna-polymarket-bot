@@ -33,6 +33,7 @@ try:
     from src.portfolio import PortfolioManager, PositionState
     from src.orderbook import OrderBookAnalyzer, OrderBookTracker
     from src.correlation import CorrelationEngine
+    from src.news import NewsAnalyzer
     from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
@@ -102,6 +103,7 @@ class LunaTradingBot:
         self.dashboard_server = None
         self.enable_orderbook = os.getenv('ENABLE_ORDERBOOK', 'true').lower() == 'true'
         self.enable_correlation = os.getenv('ENABLE_CORRELATION', 'true').lower() == 'true'
+        self.enable_news = os.getenv('ENABLE_NEWS', 'true').lower() == 'true'
         self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
@@ -180,10 +182,15 @@ class LunaTradingBot:
                 self.orderbook_tracker = OrderBookTracker(self.orderbook_analyzer)
                 logger.info("📊 Order book intelligence enabled")
             
-            # Phase 4: Correlation Engine
+            # Phase 5.2: Correlation Engine
             if self.enable_correlation:
                 self.correlation_engine = CorrelationEngine()
                 logger.info("🔗 Correlation engine enabled")
+            
+            # Phase 5.2: News Sentiment
+            if self.enable_news:
+                self.news_analyzer = NewsAnalyzer()
+                logger.info("📰 News Sentiment analyzer enabled")
             
             # Phase 4: Dashboard
             if self.enable_dashboard:
@@ -373,6 +380,27 @@ class LunaTradingBot:
                     if not can_open:
                         logger.debug(f"Correlation block: {corr_reason}")
                         ev_result = EVResult('HOLD', ev, p_bot, p_mkt, p_bot - p_mkt, f"BLOCKED: {corr_reason}")
+                
+                # ═══════════════════════════════════════════
+                # NEWS SENTIMENT ADJUSTMENT (Phase 5.2)
+                # ═══════════════════════════════════════════
+                if self.enable_news and ev_result.action == 'BUY':
+                    try:
+                        news_adj = self.news_analyzer.analyze_market(market.name, market.category)
+                        if news_adj != 0:
+                            p_bot = max(0.01, min(0.99, p_bot + news_adj))
+                            
+                            # Recalculate EV
+                            c_total = p_mkt + (spread * 0.5)
+                            ev = (p_bot * w_net) - ((1 - p_bot) * c_total)
+                            
+                            logger.info(f"📰 News sentimen: {news_adj:+.4f} -> p_bot {p_bot:.4f}")
+                            
+                            # Recheck EV gate
+                            if p_bot <= p_mkt or ev <= 0:
+                                ev_result = EVResult('HOLD', ev, p_bot, p_mkt, p_bot - p_mkt, f"News reversed edge (sentimen: {news_adj:+.4f})")
+                    except Exception as e:
+                        logger.debug(f"News analysis skipped: {e}")
                 
                 # ═══════════════════════════════════════════
                 # EXECUTION DECISION
