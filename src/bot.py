@@ -31,6 +31,9 @@ try:
     from src.strategy import LunaStrategy, RiskManager
     from src.database import LunaMemory
     from src.portfolio import PortfolioManager, PositionState
+    from src.orderbook import OrderBookAnalyzer, OrderBookTracker
+    from src.correlation import CorrelationEngine
+    from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
     MODULES_LOADED = False
@@ -84,13 +87,23 @@ class LunaTradingBot:
         self.paper_trading = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
         self.virtual_balance = self.initial_capital if self.paper_trading else 0
         
-        # Core components
+        # Phase 3 components
         self.polymarket = None
         self.order_manager = None
         self.strategy = None
         self.memory = None
         self.portfolio = None
         self.risk_manager = None
+        
+        # Phase 4 components
+        self.orderbook_analyzer = None
+        self.orderbook_tracker = None
+        self.correlation_engine = None
+        self.dashboard_server = None
+        self.enable_orderbook = os.getenv('ENABLE_ORDERBOOK', 'true').lower() == 'true'
+        self.enable_correlation = os.getenv('ENABLE_CORRELATION', 'true').lower() == 'true'
+        self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
+        self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
         # State
         self._health_ok = False
@@ -160,6 +173,25 @@ class LunaTradingBot:
             
             # Sync portfolio capital from bot
             self.portfolio.capital = self.current_capital
+            
+            # Phase 4: Order Book Analyzer
+            if self.enable_orderbook:
+                self.orderbook_analyzer = OrderBookAnalyzer(self.polymarket)
+                self.orderbook_tracker = OrderBookTracker(self.orderbook_analyzer)
+                logger.info("📊 Order book intelligence enabled")
+            
+            # Phase 4: Correlation Engine
+            if self.enable_correlation:
+                self.correlation_engine = CorrelationEngine()
+                logger.info("🔗 Correlation engine enabled")
+            
+            # Phase 4: Dashboard
+            if self.enable_dashboard:
+                import threading
+                self.dashboard_server = start_dashboard(self, self.dashboard_port)
+                if self.dashboard_server:
+                    threading.Thread(target=self.dashboard_server.serve_forever, daemon=True).start()
+                    logger.info(f"🌐 Dashboard running on port {self.dashboard_port}")
             
             self._health_ok = True
             self._errors_last_hour = 0
@@ -272,6 +304,42 @@ class LunaTradingBot:
                     action, confidence, reason = self.strategy.analyze_market(
                         market_data, memory=memory
                     )
+                    
+                    # Phase 4: Order Book Intelligence — adjust confidence
+                    if self.enable_orderbook and self.orderbook_analyzer:
+                        try:
+                            ob_analysis = self.orderbook_analyzer.analyze(market.id, market.id)
+                            if ob_analysis:
+                                ob_signals = self.orderbook_analyzer.get_trading_signals(ob_analysis)
+                                confidence_adj = ob_signals['confidence_adjustment']
+                                confidence = max(0.0, min(1.0, confidence + confidence_adj))
+                                
+                                if ob_signals['reasons']:
+                                    reason += " | OB: " + " | ".join(ob_signals['reasons'])
+                                
+                                # Track orderbook trend
+                                if self.orderbook_tracker:
+                                    self.orderbook_tracker.update(market.id)
+                        except Exception as e:
+                            logger.debug(f"Order book analysis skipped: {e}")
+                    
+                    # Phase 4: Correlation Check
+                    if self.enable_correlation and self.correlation_engine and action in ('BUY', 'SELL'):
+                        current_positions = self.portfolio.get_open_positions_detail() if self.portfolio else []
+                        mid_price = (market.best_bid + market.best_ask) / 2
+                        test_size = self.risk_manager.calculate_size(confidence, mid_price, confidence)
+                        
+                        can_open, corr_reason = self.correlation_engine.should_open_position(
+                            market.name, market.category, test_size,
+                            [{'market_name': p['market'], 'size': p['size'], 'side': p['side'], 'category': market.category} for p in current_positions]
+                        )
+                        
+                        if not can_open:
+                            logger.debug(f"Correlation block: {corr_reason}")
+                            reason += f" | ⚠️ CORRELATION: {corr_reason}"
+                            # Don't block entirely — just log (user can review)
+                        else:
+                            logger.debug(f"Correlation OK: {corr_reason}")
                     
                     # Determine side
                     mid_price = (market.best_bid + market.best_ask) / 2
