@@ -7,6 +7,18 @@ from typing import Tuple, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Market categories and their typical behavior
+CATEGORIES = {
+    'crypto': {'volatility': 'high', 'confidence_adj': -0.05},
+    'politics': {'volatility': 'medium', 'confidence_adj': 0.0},
+    'sports': {'volatility': 'medium', 'confidence_adj': 0.0},
+    'entertainment': {'volatility': 'low', 'confidence_adj': +0.05},
+    'science': {'volatility': 'low', 'confidence_adj': +0.05},
+    'geopolitics': {'volatility': 'high', 'confidence_adj': -0.05},
+    'business': {'volatility': 'medium', 'confidence_adj': 0.0},
+    'tech': {'volatility': 'high', 'confidence_adj': -0.03},
+}
+
 class LunaStrategy:
     """
     Luna's Conservative Trading Strategy

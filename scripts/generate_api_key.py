@@ -40,7 +40,7 @@ try:
     print(f"Secret: {api_creds.secret}")
     print(f"Passphrase: {api_creds.passphrase}")
     print("="*50)
-    print("\n📝 Copy these to your .env file:")
+    print("📝 Copy these to your .env file:")
     print(f"POLY_API_KEY={api_creds.api_key}")
     print(f"POLY_API_SECRET={api_creds.secret}")
     print(f"POLY_PASSPHRASE={api_creds.passphrase}")

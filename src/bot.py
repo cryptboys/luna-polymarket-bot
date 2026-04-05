@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Luna Trading Bot - Polymarket Auto Trader
 # Conservative & Self-Evolving Strategy
 # Phase 1-4 Compounding Focus
@@ -9,29 +10,44 @@ import json
 import sqlite3
 import logging
 import schedule
+import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Try to import CLOB client
+# Ensure paths exist (both local dev AND Railway docker)
+def _ensure_dirs():
+    """Create data/logs directories relative to project root"""
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = os.path.join(base, 'data')
+    logs_dir = os.path.join(base, 'logs')
+    for d in [data_dir, logs_dir]:
+        os.makedirs(d, exist_ok=True)
+    return data_dir, logs_dir
+
+DATA_DIR, LOGS_DIR = _ensure_dirs()
+
+# Try to import PolymarketClient
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds
-    CLOB_AVAILABLE = True
-    print("✅ CLOB client loaded successfully")
+    from src.polymarket import PolymarketClient, OrderManager
+    from src.strategy import LunaStrategy
+    from src.database import LunaMemory
+    MODULES_LOADED = True
 except ImportError as e:
-    CLOB_AVAILABLE = False
-    print(f"⚠️ CLOB client not available: {e}")
+    MODULES_LOADED = False
+    print(f"⚠️  Modules not available: {e}")
 
 # Setup logging
+log_file = os.path.join(LOGS_DIR, 'luna_bot.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - 🌙 LUNA - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/app/logs/luna_bot.log')
+        logging.FileHandler(log_file, encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
+
 
 class LunaTradingBot:
     """
@@ -70,12 +86,19 @@ class LunaTradingBot:
         
         # Initialize CLOB client if available
         self.clob_client = None
-        if CLOB_AVAILABLE and not self.paper_trading:
-            self._init_clob_client()
+        self.order_manager = None
+        self.polymarket = None
+        self.strategy = None
+        self.memory = None
+        
+        # Database
+        self.db_path = os.path.join(DATA_DIR, 'luna_memory.db')
+        
+        # Health check endpoint (for Railway)
+        self._health_ok = False
         
         # Initialize
-        self.init_database()
-        self.load_memory()
+        self._init_components()
         
         logger.info(f"🌙 Luna Bot Initialized")
         logger.info(f"💰 Capital: ${self.current_capital:.2f} | Phase: {self.phase} ({self.PHASES[self.phase]['name']})")
@@ -89,142 +112,47 @@ class LunaTradingBot:
         else:
             logger.info("⚠️ Running in mock mode (no CLOB connection)")
 
-    def _init_clob_client(self):
-        """Initialize Polymarket CLOB client"""
+    def _init_components(self):
+        """Initialize all bot components"""
         try:
-            private_key = os.getenv('POLY_PRIVATE_KEY')
-            if not private_key:
-                logger.warning("POLY_PRIVATE_KEY not set, skipping CLOB init")
-                return
+            # Memory (always — paper or live)
+            self.memory = LunaMemory(db_path=self.db_path)
+            self.memory.load_capital_into(self)
             
-            self.clob_client = ClobClient(
-                host="https://clob.polymarket.com",
-                key=private_key,
-                chain_id=137  # Polygon
-            )
+            # Strategy
+            self.strategy = LunaStrategy(phase=self.phase)
             
-            # Set API credentials if available
-            api_key = os.getenv('POLY_API_KEY')
-            api_secret = os.getenv('POLY_API_SECRET')
-            passphrase = os.getenv('POLY_PASSPHRASE')
-            
-            if api_key and api_secret:
-                self.clob_client.set_api_creds(ApiCreds(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    api_passphrase=passphrase
-                ))
-                logger.info("✅ CLOB client initialized with API credentials")
+            # Polymarket client
+            if not self.paper_trading:
+                private_key = os.getenv('POLY_PRIVATE_KEY')
+                if private_key:
+                    self.polymarket = PolymarketClient(
+                        api_key=os.getenv('POLY_API_KEY'),
+                        api_secret=os.getenv('POLY_API_SECRET'),
+                        passphrase=os.getenv('POLY_PASSPHRASE'),
+                        private_key=private_key,
+                    )
+                    self.order_manager = OrderManager(self.polymarket)
+                    if self.polymarket.is_connected():
+                        logger.info("✅ Polymarket CLOB client connected")
+                        balance = self.polymarket.get_balance()
+                        if balance > 0:
+                            logger.info(f"💵 CLOB Balance: ${balance:.2f}")
+                    else:
+                        logger.warning("⚠️ Polymarket client not connected — check private key & API creds")
+                else:
+                    logger.warning("⚠️ POLY_PRIVATE_KEY not set — mock mode")
             else:
-                logger.info("⚠️ CLOB client initialized without API credentials")
-                
+                logger.info("📊 Paper trading — using mock Polymarket client")
+                # Create mock client for paper trading
+                self.polymarket = PolymarketClient()
+                self.order_manager = OrderManager(self.polymarket)
+            
+            self._health_ok = True
+            
         except Exception as e:
-            logger.error(f"❌ Failed to initialize CLOB client: {e}")
-            self.clob_client = None
-
-    def init_database(self):
-        """Initialize SQLite for trade memory and evolution"""
-        try:
-            conn = sqlite3.connect('/app/data/luna_memory.db')
-            cursor = conn.cursor()
-            
-            # Trades table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-                    date TEXT,
-                    market_id TEXT,
-                    market_name TEXT,
-                    action TEXT,
-                    side TEXT,
-                    size REAL,
-                    price REAL,
-                    confidence REAL,
-                    expected_return REAL,
-                    actual_pnl REAL,
-                    status TEXT DEFAULT 'OPEN',
-                    exit_price REAL,
-                    exit_time TEXT,
-                    lesson_learned TEXT,
-                    phase INTEGER
-                )
-            ''')
-            
-            # Daily evolution table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS evolution (
-                    date TEXT PRIMARY KEY,
-                    starting_capital REAL,
-                    ending_capital REAL,
-                    total_trades INTEGER,
-                    winning_trades INTEGER,
-                    losing_trades INTEGER,
-                    win_rate REAL,
-                    roi_percent REAL,
-                    lessons TEXT,
-                    phase INTEGER
-                )
-            ''')
-            
-            # Market analysis memory
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS market_memory (
-                    market_id TEXT PRIMARY KEY,
-                    first_seen TEXT,
-                    last_analyzed TEXT,
-                    total_signals INTEGER,
-                    successful_signals INTEGER,
-                    avg_confidence REAL,
-                    market_category TEXT
-                )
-            ''')
-            
-            conn.commit()
-            conn.close()
-            logger.info("✅ Database initialized")
-        except Exception as e:
-            logger.error(f"❌ Database init failed: {e}")
-            raise
-
-    def load_memory(self):
-        """Load previous session data"""
-        try:
-            conn = sqlite3.connect('/app/data/luna_memory.db')
-            cursor = conn.cursor()
-            
-            # Get latest capital
-            cursor.execute('''
-                SELECT ending_capital FROM evolution 
-                ORDER BY date DESC LIMIT 1
-            ''')
-            result = cursor.fetchone()
-            if result and result[0]:
-                self.current_capital = result[0]
-                logger.info(f"📊 Loaded capital from memory: ${self.current_capital:.2f}")
-            
-            # Check phase progression
-            cursor.execute('''
-                SELECT COUNT(*) FROM trades WHERE status = 'CLOSED' AND actual_pnl > 0
-            ''')
-            wins = cursor.fetchone()[0]
-            
-            cursor.execute('''
-                SELECT COUNT(*) FROM trades WHERE status = 'CLOSED'
-            ''')
-            total = cursor.fetchone()[0]
-            
-            if total > 0:
-                win_rate = wins / total
-                logger.info(f"📈 Historical Win Rate: {win_rate*100:.1f}% ({wins}/{total})")
-                
-                # Auto phase progression logic
-                if win_rate > 0.70 and self.phase < 4 and total >= 10:
-                    logger.info(f"🚀 Win rate >70% with {total} trades - ready for Phase {self.phase + 1}")
-            
-            conn.close()
-        except Exception as e:
-            logger.warning(f"⚠️ Could not load memory: {e}")
+            logger.error(f"❌ Component init failed: {e}")
+            self._health_ok = False
 
     def calculate_position_size(self, confidence, price=0.5):
         """
@@ -238,14 +166,16 @@ class LunaTradingBot:
         confidence_multiplier = min(confidence / phase_config['min_confidence'], 1.5)
         
         # Adjust by price (closer to 0.5 = more uncertain, smaller position)
-        price_uncertainty = 1 - abs(price - 0.5) * 2  # 0.5 -> 0, 0/1 -> 1
-        price_adjustment = 0.5 + (price_uncertainty * 0.5)  # 0.5 to 1.0
+        price_uncertainty = 1 - abs(float(price) - 0.5) * 2
+        price_adjustment = 0.5 + (price_uncertainty * 0.5)
         
         final_size = base_size * confidence_multiplier * price_adjustment
         
         # Hard limits
-        max_single_trade = self.current_capital * 0.25  # Never more than 25%
-        final_size = min(final_size, max_single_trade)
+        max_single_trade = self.current_capital * 0.25
+        min_trade = 1.0  # Min $1
+        
+        final_size = max(min_trade, min(final_size, max_single_trade))
         
         return round(final_size, 2)
 
@@ -253,7 +183,6 @@ class LunaTradingBot:
         """Check if daily drawdown exceeded"""
         today = datetime.now().date()
         
-        # Reset daily PnL if new day
         if today != self.last_reset:
             self.daily_pnl = 0.0
             self.last_reset = today
@@ -267,102 +196,197 @@ class LunaTradingBot:
         
         return True
 
-    def analyze_market(self, market_data):
-        """
-        Luna's market analysis logic
-        Returns: (action, confidence, reason)
-        """
-        # Placeholder - will be implemented with actual Polymarket data
-        # This is where Luna's AI/strategy goes
+    def check_markets(self):
+        """Main market checking loop"""
+        logger.info("🔍 Checking markets...")
         
-        # Example conservative criteria:
-        # - High liquidity (> $10k)
-        # - Clear directional signal
-        # - Price not too extreme (< 0.85 or > 0.15)
-        # - Recent volume spike
+        if not self.check_drawdown():
+            logger.warning("⏸️ Trading paused due to drawdown limit")
+            return
         
-        return 'HOLD', 0.0, 'Analysis placeholder - waiting for market data'
-
-    def log_trade(self, market_id, market_name, action, side, size, price, confidence, expected_return):
-        """Log trade to database"""
+        if not self.polymarket:
+            logger.error("❌ Polymarket client not initialized")
+            return
+        
+        # Fetch markets
         try:
-            conn = sqlite3.connect('/app/data/luna_memory.db')
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO trades 
-                (date, market_id, market_name, action, side, size, price, confidence, expected_return, phase)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                datetime.now().strftime('%Y-%m-%d'),
-                market_id,
-                market_name,
-                action,
-                side,
-                size,
-                price,
-                confidence,
-                expected_return,
-                self.phase
-            ))
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"📝 Trade logged: {action} {side} ${size} @ {price}")
+            markets = self.polymarket.get_markets(limit=50)
         except Exception as e:
-            logger.error(f"❌ Failed to log trade: {e}")
+            logger.error(f"Failed to fetch markets: {e}")
+            return
+        
+        if not markets:
+            logger.info("No markets found — skipping")
+            return
+        
+        logger.info(f"📊 Analyzing {len(markets)} markets...")
+        
+        # Analyze each market
+        for market in markets:
+            try:
+                # Prepare market data for strategy
+                market_data = {
+                    'id': market.id,
+                    'name': market.name,
+                    'category': market.category,
+                    'best_bid': market.best_bid,
+                    'best_ask': market.best_ask,
+                    'liquidity': market.liquidity,
+                    'volume_24h': market.volume_24h,
+                    'price_change_24h': market.price_change_24h,
+                    'days_to_resolution': market.days_to_resolution,
+                    'slug': market.slug,
+                }
+                
+                # Strategy analysis
+                if self.strategy:
+                    action, confidence, reason = self.strategy.analyze_market(
+                        market_data, 
+                        memory=self.memory.get_market_memory(market.id) if self.memory else None
+                    )
+                    
+                    if action in ('BUY', 'SELL'):
+                        # Calculate position size
+                        mid_price = (market.best_bid + market.best_ask) / 2
+                        size = self.calculate_position_size(confidence, mid_price)
+                        
+                        logger.info(f"🎯 SIGNAL: {action} — {market.name[:60]}")
+                        logger.info(f"   Confidence: {confidence:.1%} | Size: ${size:.2f}")
+                        logger.info(f"   Reason: {reason}")
+                        
+                        if size >= 1.0:  # Only trade if size >= $1
+                            if self.paper_trading:
+                                # Paper trade
+                                self._execute_paper_trade(market, action, size, confidence, reason, mid_price)
+                            elif self.order_manager:
+                                # Live trade
+                                self._execute_live_trade(market, action, size, confidence, reason, mid_price)
+                            else:
+                                logger.warning("⚠️ No order manager — cannot execute trade")
+                
+            except Exception as e:
+                logger.warning(f"Error analyzing market {market.id}: {e}")
+                continue
+            
+            # Sleep between markets to avoid rate limiting
+            time.sleep(0.5)
+        
+        logger.info(f"✅ Market check complete — analyzed {len(markets)} markets")
+
+    def _execute_paper_trade(self, market, action, size, confidence, reason, price):
+        """Execute a simulated trade in paper mode"""
+        side = 'Yes' if action == 'BUY' else 'No'
+        
+        # Simulate trade
+        cost = size * (1 - price) if action == 'SELL' else size * price
+        potential_return = size - cost
+        expected_roi = (potential_return / cost * 100) if cost > 0 else 0
+        
+        logger.info(f"📝 PAPER TRADE: {action} ${size:.2f} {side} @ ${price:.3f}")
+        logger.info(f"   Cost: ${cost:.2f} | Potential return: ${potential_return:.2f} ({expected_roi:.1f}%)")
+        
+        # Log to database
+        if self.memory:
+            self.memory.log_paper_trade({
+                'market_id': market.id,
+                'market_name': market.name,
+                'action': action,
+                'side': side,
+                'size': size,
+                'price': price,
+                'confidence': confidence,
+                'cost': cost,
+                'potential_return': potential_return,
+                'expected_roi': expected_roi,
+                'reason': reason,
+                'phase': self.phase,
+            })
+        
+        # Adjust virtual balance
+        self.virtual_balance -= cost
+        logger.info(f"💵 Virtual balance: ${self.virtual_balance:.2f}")
+        
+        # Phase progression check
+        self._check_phase_progression()
+    
+    def _execute_live_trade(self, market, action, confidence, reason, price):
+        """Execute a real trade via CLOB"""
+        side = action  # BUY or SELL
+        
+        result = self.order_manager.submit_order(
+            market_id=market.id,
+            side=side,
+            size=0.0,  # Size determined by strategy
+            confidence=confidence,
+        )
+        
+        if result.get('success'):
+            logger.info(f"✅ LIVE TRADE: {result}")
+            if self.memory:
+                self.memory.log_live_trade({
+                    'market_id': market.id,
+                    'market_name': market.name,
+                    'action': action,
+                    'size': result.get('size', 0),
+                    'price': result.get('price', price),
+                    'confidence': confidence,
+                    'order_id': result.get('order_id', ''),
+                    'phase': self.phase,
+                })
+        else:
+            logger.error(f"❌ Trade failed: {result.get('error', 'Unknown error')}")
+
+    def _check_phase_progression(self):
+        """Check if bot should advance to next phase"""
+        if self.memory:
+            stats = self.memory.get_trading_stats()
+            closed_trades = stats.get('total_closed', 0)
+            win_rate = stats.get('win_rate', 0)
+            
+            if closed_trades >= 10 and win_rate > 0.70 and self.phase < 4:
+                logger.info(f"🚀 Win rate {win_rate:.1%} with {closed_trades} trades — ready for Phase {self.phase + 1}!")
+                self.phase += 1
+                logger.info(f"📈 Phase advanced to {self.phase} ({self.PHASES[self.phase]['name']})")
+                
+                if self.strategy:
+                    self.strategy.phase = self.phase
 
     def generate_daily_report(self):
         """Generate daily evolution report"""
         try:
-            conn = sqlite3.connect('/app/data/luna_memory.db')
-            cursor = conn.cursor()
+            if not self.memory:
+                logger.warning("No memory module — cannot generate report")
+                return None
             
             today = datetime.now().strftime('%Y-%m-%d')
+            stats = self.memory.get_trading_stats(today)
             
-            # Get today's stats
-            cursor.execute('''
-                SELECT COUNT(*), 
-                       SUM(CASE WHEN actual_pnl > 0 THEN 1 ELSE 0 END),
-                       SUM(actual_pnl)
-                FROM trades 
-                WHERE date = ? AND status = 'CLOSED'
-            ''', (today,))
+            total_trades = stats.get('total_trades', 0)
+            wins = stats.get('winning_trades', 0)
+            losses = stats.get('losing_trades', 0)
+            win_rate = stats.get('win_rate', 0)
+            pnl = stats.get('pnl', 0)
+            roi = stats.get('roi', 0)
             
-            total, wins, pnl = cursor.fetchone()
-            wins = wins or 0
-            pnl = pnl or 0
-            
-            win_rate = (wins / total * 100) if total > 0 else 0
-            roi = (pnl / self.current_capital * 100) if self.current_capital > 0 else 0
-            
-            # Save to evolution
-            cursor.execute('''
-                INSERT OR REPLACE INTO evolution 
-                (date, starting_capital, ending_capital, total_trades, winning_trades, 
-                 losing_trades, win_rate, roi_percent, phase)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                today,
-                self.current_capital - pnl,
-                self.current_capital,
-                total or 0,
-                wins,
-                (total or 0) - wins,
-                win_rate,
-                roi,
-                self.phase
-            ))
-            
-            conn.commit()
-            conn.close()
+            # Save evolution
+            self.memory.save_daily_evolution({
+                'date': today,
+                'starting_capital': self.current_capital,
+                'ending_capital': self.current_capital + pnl,
+                'total_trades': total_trades,
+                'winning_trades': wins,
+                'losing_trades': losses,
+                'win_rate': win_rate,
+                'roi_percent': roi,
+                'phase': self.phase,
+            })
             
             report = f"""📊 LUNA DAILY REPORT - {today}
 
 💰 Capital: ${self.current_capital:.2f}
 📈 PnL: ${pnl:+.2f} ({roi:+.2f}%)
-🎯 Trades: {total or 0} | ✅ Wins: {wins} | ❌ Losses: {(total or 0) - wins}
-🏆 Win Rate: {win_rate:.1f}%
+🎯 Trades: {total_trades} | ✅ Wins: {wins} | ❌ Losses: {losses}
+🏆 Win Rate: {win_rate:.1%}
 🚀 Phase: {self.phase} ({self.PHASES[self.phase]['name']})
 💵 Virtual Balance: ${self.virtual_balance:.2f}
 
@@ -382,7 +406,6 @@ Keep compounding! 🌙"""
     def _send_telegram_alert(self, message: str):
         """Send alert via Telegram"""
         try:
-            import requests
             bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
             chat_id = os.getenv('TELEGRAM_CHAT_ID')
             
@@ -393,32 +416,22 @@ Keep compounding! 🌙"""
             payload = {
                 'chat_id': chat_id,
                 'text': message,
-                'parse_mode': 'Markdown'
             }
             
-            requests.post(url, json=payload, timeout=10)
-            logger.info("📱 Telegram alert sent")
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logger.info("📱 Telegram alert sent")
+            else:
+                logger.warning(f"⚠️ Telegram API error: {resp.status_code}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to send Telegram alert: {e}")
-
-    def check_markets(self):
-        """Main market checking loop"""
-        logger.info("🔍 Checking markets...")
-        
-        # Check drawdown limit
-        if not self.check_drawdown():
-            logger.warning("⏸️ Trading paused due to drawdown limit")
-            return
-        
-        # Placeholder: In real implementation, fetch from Polymarket CLOB
-        # markets = self.client.get_markets()
-        
-        logger.info("ℹ️ Market check complete (waiting for Polymarket connection)")
 
     def run(self):
         """Main bot loop"""
         logger.info("🚀 Luna Bot Starting...")
         logger.info(f"⏱️ Check interval: {self.check_interval} minutes")
+        logger.info(f"📊 Mode: {'PAPER' if self.paper_trading else 'LIVE'}")
+        logger.info(f"🛡️ Max daily drawdown: {self.max_daily_loss*100:.0f}%")
         
         # Schedule tasks
         schedule.every(self.check_interval).minutes.do(self.check_markets)
@@ -431,7 +444,7 @@ Keep compounding! 🌙"""
         while True:
             try:
                 schedule.run_pending()
-                time.sleep(60)  # Check every minute
+                time.sleep(30)  # Check every 30 seconds for graceful shutdown
             except KeyboardInterrupt:
                 logger.info("👋 Luna Bot shutting down gracefully...")
                 self.generate_daily_report()
@@ -439,6 +452,7 @@ Keep compounding! 🌙"""
             except Exception as e:
                 logger.error(f"❌ Error in main loop: {e}")
                 time.sleep(60)
+
 
 if __name__ == "__main__":
     bot = LunaTradingBot()
