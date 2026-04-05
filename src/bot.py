@@ -28,7 +28,7 @@ DATA_DIR, LOGS_DIR = _ensure_dirs()
 # Import modules
 try:
     from src.polymarket import PolymarketClient, OrderManager, Market
-    from src.strategy import LunaStrategy, RiskManager
+    from src.strategy import LunaStrategy, RiskManager, EVResult
     from src.database import LunaMemory
     from src.portfolio import PortfolioManager, PositionState
     from src.orderbook import OrderBookAnalyzer, OrderBookTracker
@@ -253,7 +253,15 @@ class LunaTradingBot:
             self._health_ok = False
 
     def _analyze_and_trade(self):
-        """Fetch markets, analyze, and execute trades"""
+        """
+        Phase 5.1: EV-based market analysis and trading.
+        
+        Decision flow:
+        1. Strategy returns EVResult(action, ev, p_bot, p_mkt, edge, reason)
+        2. Only BUY if action == 'BUY' (meaning P_bot > P_mkt AND EV > min_threshold)
+        3. Size position using Kelly from (p_bot, p_mkt)
+        4. Execute paper or live trade
+        """
         if not self.polymarket:
             logger.error("No Polymarket client available")
             return
@@ -271,14 +279,14 @@ class LunaTradingBot:
         
         logger.info(f"📊 Analyzing {len(markets)} markets...")
         trades_executed = 0
+        hold_count = 0
+        no_edge_count = 0
         
         for market in markets:
             try:
-                # Skip markets we already have positions in
                 if market.id in [p.market_id for p in self.portfolio.positions.values()]:
                     continue
                 
-                # Prepare market data for strategy
                 market_data = {
                     'id': market.id,
                     'name': market.name,
@@ -294,108 +302,133 @@ class LunaTradingBot:
                     'market_age_days': market.market_age_days,
                 }
                 
-                # Get market memory
                 memory = None
                 if self.memory:
                     memory = self.memory.get_market_memory(market.id)
                 
-                # Strategy analysis
-                if self.strategy:
-                    action, confidence, reason = self.strategy.analyze_market(
-                        market_data, memory=memory
+                if not self.strategy:
+                    continue
+                
+                # ═══════════════════════════════════════════
+                # EV ANALYSIS (Phase 5.1)
+                # ═══════════════════════════════════════════
+                ev_result: EVResult = self.strategy.analyze_market(market_data, memory)
+                
+                # Track in history
+                if self.memory:
+                    self.memory.log_signal(
+                        market_id=market.id,
+                        market_name=market.name,
+                        category=market.category,
+                        action=ev_result.action,
+                        confidence=ev_result.p_bot,
+                        market_score=ev_result.p_bot,
+                        kelly_fraction=LunaStrategy.kelly_fraction(ev_result.p_bot, ev_result.p_mkt),
+                        recommended_side='YES' if ev_result.p_bot > ev_result.p_mkt else 'NO',
+                        phase=self.phase,
+                    )
+                
+                # ═══════════════════════════════════════════
+                # ORDER BOOK INTELLIGENCE (optional boost)
+                # ═══════════════════════════════════════════
+                ev = ev_result.ev
+                p_bot = ev_result.p_bot
+                p_mkt = ev_result.p_mkt
+                side = 'YES' if p_bot > p_mkt else 'NO'
+                
+                if self.enable_orderbook and self.orderbook_analyzer:
+                    try:
+                        ob_analysis = self.orderbook_analyzer.analyze(market.id, market.id)
+                        if ob_analysis:
+                            ob_signals = self.orderbook_analyzer.get_trading_signals(ob_analysis)
+                            ob_adj = ob_signals['confidence_adjustment']
+                            if ob_signals['recommended_action'] == 'BEARISH':
+                                p_bot = max(0.01, p_bot - abs(ob_adj) * 0.5)
+                            elif ob_signals['recommended_action'] == 'BULLISH':
+                                p_bot = min(0.99, p_bot + abs(ob_adj) * 0.5)
+                            
+                            if self.orderbook_tracker:
+                                self.orderbook_tracker.update(market.id)
+                    except Exception as e:
+                        logger.debug(f"Order book analysis skipped: {e}")
+                
+                # Recheck EV after orderbook adjustment
+                spread = market.best_ask - market.best_bid
+                c_total = p_mkt + (spread * 0.5)
+                w_net = 1.0 - c_total
+                ev = (p_bot * w_net) - ((1 - p_bot) * c_total)
+                
+                # ═══════════════════════════════════════════
+                # CORRELATION CHECK
+                # ═══════════════════════════════════════════
+                if self.enable_correlation and self.correlation_engine and ev_result.action == 'BUY':
+                    current_pos = self.portfolio.get_open_positions_detail() if self.portfolio else []
+                    test_size = self.risk_manager.calculate_size(p_bot, p_mkt)
+                    
+                    can_open, corr_reason = self.correlation_engine.should_open_position(
+                        market.name, market.category, test_size,
+                        [{'market_name': p['market'], 'size': p['size'], 'side': p['side'], 'category': market.category} for p in current_pos]
                     )
                     
-                    # Phase 4: Order Book Intelligence — adjust confidence
-                    if self.enable_orderbook and self.orderbook_analyzer:
-                        try:
-                            ob_analysis = self.orderbook_analyzer.analyze(market.id, market.id)
-                            if ob_analysis:
-                                ob_signals = self.orderbook_analyzer.get_trading_signals(ob_analysis)
-                                confidence_adj = ob_signals['confidence_adjustment']
-                                confidence = max(0.0, min(1.0, confidence + confidence_adj))
-                                
-                                if ob_signals['reasons']:
-                                    reason += " | OB: " + " | ".join(ob_signals['reasons'])
-                                
-                                # Track orderbook trend
-                                if self.orderbook_tracker:
-                                    self.orderbook_tracker.update(market.id)
-                        except Exception as e:
-                            logger.debug(f"Order book analysis skipped: {e}")
+                    if not can_open:
+                        logger.debug(f"Correlation block: {corr_reason}")
+                        ev_result = EVResult('HOLD', ev, p_bot, p_mkt, p_bot - p_mkt, f"BLOCKED: {corr_reason}")
+                
+                # ═══════════════════════════════════════════
+                # EXECUTION DECISION
+                # ═══════════════════════════════════════════
+                if ev_result.action == 'BUY' and ev > 0:
+                    # Kelly sizing
+                    size = self.risk_manager.calculate_size(p_bot, p_mkt)
                     
-                    # Phase 4: Correlation Check
-                    if self.enable_correlation and self.correlation_engine and action in ('BUY', 'SELL'):
-                        current_positions = self.portfolio.get_open_positions_detail() if self.portfolio else []
-                        mid_price = (market.best_bid + market.best_ask) / 2
-                        test_size = self.risk_manager.calculate_size(confidence, mid_price, confidence)
+                    if size >= 1.0:
+                        logger.info(f"🎯 BUY {side} — {market.name[:60]}")
+                        logger.info(f"   Our {p_bot:.1%} vs Market {p_mkt:.1%} (edge: {ev_result.edge:+.1%})")
+                        logger.info(f"   EV: ${ev:+.4f} | Size: ${size:.2f} | Kelly: {LunaStrategy.kelly_fraction(p_bot, p_mkt):.1%}")
+                        logger.info(f"   Cost: ${c_total:.4f} | WinNet: ${w_net:.4f}")
+                        logger.info(f"   Reason: {ev_result.reason}")
                         
-                        can_open, corr_reason = self.correlation_engine.should_open_position(
-                            market.name, market.category, test_size,
-                            [{'market_name': p['market'], 'size': p['size'], 'side': p['side'], 'category': market.category} for p in current_positions]
-                        )
-                        
-                        if not can_open:
-                            logger.debug(f"Correlation block: {corr_reason}")
-                            reason += f" | ⚠️ CORRELATION: {corr_reason}"
-                            # Don't block entirely — just log (user can review)
-                        else:
-                            logger.debug(f"Correlation OK: {corr_reason}")
-                    
-                    # Determine side
-                    mid_price = (market.best_bid + market.best_ask) / 2
-                    side = 'YES' if mid_price >= 0.5 else 'NO'
-                    if action == 'SELL':
-                        side = 'NO' if side == 'YES' else 'YES'
-                    
-                    if action in ('BUY', 'SELL') and confidence >= 0.55:
-                        # Calculate position size
-                        size = self.risk_manager.calculate_size(confidence, mid_price, confidence)
-                        
-                        if size >= 1.0:
-                            logger.info(f"🎯 SIGNAL: {action} {side} — {market.name[:60]}")
-                            logger.info(f"   Confidence: {confidence:.1%} | Score: {confidence:.2f} | Size: ${size:.2f}")
-                            logger.info(f"   Reason: {reason}")
-                            
-                            # Execute trade
-                            if self.paper_trading:
-                                self._execute_paper_trade(market, action, side, size, confidence, reason, mid_price)
-                                trades_executed += 1
-                            elif self.order_manager:
-                                self._execute_live_trade(market, action, side, size, confidence, reason, mid_price)
-                                trades_executed += 1
+                        if self.paper_trading:
+                            self._execute_paper_trade(market, side, size, p_bot, p_mkt, ev, market.best_bid)
+                            trades_executed += 1
+                        elif self.order_manager:
+                            self._execute_live_trade(market, side, size, p_bot, p_mkt, ev, market.best_bid)
+                            trades_executed += 1
+                    else:
+                        logger.debug(f"Skip {market.name[:40]}: size ${size:.2f} below $1 min")
+                else:
+                    hold_count += 1
+                    if ev_result.action == 'HOLD' and ev_result.edge <= 0:
+                        no_edge_count += 1
+                    logger.debug(f"  HOLD {market.name[:40]} | {ev_result.reason}")
                 
             except Exception as e:
                 logger.debug(f"Error analyzing {market.id}: {e}")
                 continue
             
-            # Rate limit pause
-            time.sleep(0.5)
+            time.sleep(0.3)
         
-        logger.info(f"✅ Market check complete — {trades_executed} trades executed")
+        logger.info(f"✅ Scanned {len(markets)} | {trades_executed} trades | {hold_count} holds ({no_edge_count} no-edge)")
 
     # ═══════════════════════════════════════════
-    # TRADE EXECUTION
+    # TRADE EXECUTION — Phase 5.1: EV-based
     # ═══════════════════════════════════════════
     
-    def _execute_paper_trade(self, market, action, side, size, confidence, reason, price):
-        """Execute simulated trade"""
-        # Determine position_id
+    def _execute_paper_trade(self, market, side, size, p_bot, p_mkt, ev, price):
+        """Execute simulated trade — EV-based"""
         position_id = f"paper-{market.id}-{datetime.now().strftime('%H%M%S')}"
         
-        # Calculate cost
         if side == 'YES':
             cost = size * price
-            max_payout = size
         else:
             cost = size * (1 - price)
-            max_payout = size
         
+        max_payout = size
         potential_pnl = max_payout - cost
         expected_roi = (potential_pnl / cost * 100) if cost > 0 else 0
         
         logger.info(f"📝 PAPER: {side} ${size:.2f} @ ${price:.3f} | Cost: ${cost:.2f} | Potential: ${potential_pnl:.2f} ({expected_roi:.0f}%)")
         
-        # Open in portfolio
         self.portfolio.open_position(
             position_id=position_id,
             market_id=market.id,
@@ -403,67 +436,54 @@ class LunaTradingBot:
             side=side,
             entry_price=price,
             size=size,
-            kelly_fraction=size / self.current_capital if self.current_capital > 0 else 0,
-            market_score=confidence,
-            confidence=confidence,
+            kelly_fraction=LunaStrategy.kelly_fraction(p_bot, p_mkt),
+            market_score=p_bot,
+            confidence=p_bot,
         )
         
-        # Update risk manager
         self.risk_manager.record_trade(0, size)
         
-        # Log signal
         if self.memory:
-            self.memory.log_signal(
-                market_id=market.id,
-                market_name=market.name,
-                category=market.category,
-                action=action,
-                confidence=confidence,
-                market_score=confidence,
-                kelly_fraction=size / self.current_capital if self.current_capital > 0 else 0,
-                recommended_side=side,
-                phase=self.phase,
-            )
+            self.memory.log_paper_trade({
+                'market_id': market.id,
+                'market_name': market.name,
+                'action': 'BUY',
+                'side': side,
+                'size': size,
+                'price': price,
+                'confidence': p_bot,
+                'market_score': p_bot,
+                'kelly_fraction': LunaStrategy.kelly_fraction(p_bot, p_mkt),
+                'cost': cost,
+                'potential_return': potential_pnl,
+                'expected_roi': expected_roi,
+                'reason': f"P_bot {p_bot:.1%} > P_mkt {p_mkt:.1%} | EV ${ev:+.4f}",
+                'phase': self.phase,
+            })
         
-        # Virtual balance update
         self.virtual_balance -= cost
-        
-        # Check phase progression
         self._check_phase_progression()
     
-    def _execute_live_trade(self, market, action, side, size, confidence, reason, price):
-        """Execute live trade on CLOB"""
+    def _execute_live_trade(self, market, side, size, p_bot, p_mkt, ev, price):
+        """Execute live trade on CLOB — EV-based"""
         try:
             result = self.order_manager.submit_order(
-                market_id=market.id,
-                side=action,
-                size=size,
-                confidence=confidence,
-                price=price,
+                market_id=market.id, side='BUY', size=size, confidence=p_bot, price=price,
             )
-            
             if result.get('success'):
                 order_id = result.get('order_id', f'live-{time.time()}')
-                
                 self.portfolio.open_position(
-                    position_id=order_id,
-                    market_id=market.id,
-                    market_name=market.name,
-                    side=side,
-                    entry_price=price,
-                    size=size,
-                    kelly_fraction=size / self.current_capital if self.current_capital > 0 else 0,
-                    market_score=confidence,
-                    confidence=confidence,
+                    position_id=order_id, market_id=market.id, market_name=market.name,
+                    side=side, entry_price=price, size=size,
+                    kelly_fraction=LunaStrategy.kelly_fraction(p_bot, p_mkt),
+                    market_score=p_bot, confidence=p_bot,
                 )
-                
                 self.risk_manager.record_trade(0, size)
                 logger.info(f"✅ LIVE: Order {order_id} placed")
             else:
                 logger.error(f"❌ Live trade failed: {result.get('error')}")
-                
         except Exception as e:
-            logger.error(f"❌ Live trade execution error: {e}")
+            logger.error(f"❌ Live trade error: {e}")
 
     # ═══════════════════════════════════════════
     # PORTFOLIO LIFECYCLE
