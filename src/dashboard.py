@@ -300,7 +300,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         pass
     
     def do_GET(self):
-        if self.path == '/' or self.path == '/dashboard':
+        if self.path == '/health':
+            self.send_json({'status': 'ok'}, 200)
+        elif self.path == '/' or self.path == '/dashboard':
             self.send_html(DASHBOARD_HTML)
         elif self.path == '/api/status':
             self.send_json(self._get_status())

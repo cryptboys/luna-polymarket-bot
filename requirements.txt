@@ -1,18 +1,5 @@
-# Requirements for Luna Bot with Polymarket CLOB
-# Install in order: core -> web3 -> clob
-
-# Core
 python-dotenv>=1.0.0
 requests>=2.31.0
 schedule>=1.2.0
-
-# Web3 stack (required by py-clob-client)
-web3==6.15.0
-eth-account>=0.11.0
-eth-utils>=2.0.0
-
-# HTTP client
 httpx>=0.25.0
-
-# Polymarket CLOB SDK
 py-clob-client==0.17.0

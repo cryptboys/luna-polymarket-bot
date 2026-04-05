@@ -1,17 +1,22 @@
-# Simple Dockerfile for Railway
 FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential gcc libffi-dev libgmp-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy files
 COPY requirements.txt .
-COPY src/ ./src/
 
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create data folder
+COPY . .
+
 RUN mkdir -p /app/data /app/logs
 
-# Run bot
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8080
+
 CMD ["python", "src/bot.py"]
