@@ -60,13 +60,17 @@ class Position:
         if self.entry_price <= 0:
             return 0.0
         if self.exit_price:
-            return ((self.exit_price - self.entry_price) / self.entry_price) * 100
+            return self._calc_roi(self.entry_price, self.exit_price) * 100
         if self.current_price <= 0:
             return 0.0
+        return self._calc_roi(self.entry_price, self.current_price) * 100
+
+    def _calc_roi(self, entry: float, exit_price: float) -> float:
         if self.side == 'YES':
-            return ((self.current_price - self.entry_price) / self.entry_price) * 100
-        else:
-            return ((self.entry_price - self.current_price) / self.entry_price) * 100
+            return (exit_price - entry) / entry if entry > 0 else 0.0
+        cost = 1 - entry
+        value = 1 - exit_price
+        return (value - cost) / cost if cost > 0 else 0.0
     
     @property
     def potential_payout(self) -> float:
