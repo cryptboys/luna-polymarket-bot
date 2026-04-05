@@ -36,6 +36,11 @@ try:
     from src.news import NewsAnalyzer
     from src.evolution import EvolutionEngine
     from src.compounding import CompoundingEngine
+    from src.market_filter import MarketFilter, MarketFilterConfig
+    from src.price_service import PriceService, GammaPriceProvider, PaperPriceProvider
+    from src.kelly_cache import KellyCache
+    from src.pnl import PnlCalculator
+    from src.rate_limiter import ApiRateLimiter
     from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
@@ -109,6 +114,7 @@ class LunaTradingBot:
         self.enable_evolution = os.getenv('ENABLE_EVOLUTION', 'true').lower() == 'true'
         self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
         self.enable_compounding = os.getenv('ENABLE_COMPOUNDING', 'true').lower() == 'true'
+        self.enable_market_filter = os.getenv('ENABLE_MARKET_FILTER', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
         # State
@@ -213,6 +219,34 @@ class LunaTradingBot:
                     min_profit_offload=float(os.getenv('MIN_PROFIT_OFFLOAD', 0.10))
                 )
                 logger.info(f"📈 Compounding Protocol enabled (Quarter Kelly, {self.PHASES[self.phase]['max_position']*100:.0f}% max)")
+
+            # Efficiency: Market Filter
+            self.market_filter = None
+            if self.enable_market_filter:
+                self.market_filter = MarketFilter(MarketFilterConfig(
+                    max_duration_hours=int(os.getenv('MAX_DURATION_HOURS', 168)),
+                    min_liquidity=self.min_liquidity,
+                    min_volume_24h=float(os.getenv('MIN_VOLUME_24H', 1000)),
+                    max_spread_bps=int(os.getenv('MAX_SPREAD_BPS', 200)),
+                ))
+                logger.info(f"🚧 Market Filter enabled (max {int(os.getenv('MAX_DURATION_HOURS', 168))}h duration)")
+
+            # Efficiency: Price Service
+            self.price_service = None
+            if self.enable_market_filter or self.compounding:
+                gamma = GammaPriceProvider()
+                paper = PaperPriceProvider()
+                self.price_service = PriceService(
+                    gamma_provider=gamma,
+                    paper_provider=paper,
+                    use_paper=self.paper_trading
+                )
+
+            # Efficiency: Kelly Cache
+            self.kelly_cache = KellyCache()
+
+            # Efficiency: Rate Limiter
+            self.rate_limiter = ApiRateLimiter()
             
             # Phase 4: Dashboard
             if self.enable_dashboard:
@@ -282,39 +316,53 @@ class LunaTradingBot:
             self._health_ok = False
 
     def _analyze_and_trade(self):
-        """
-        Phase 5.1: EV-based market analysis and trading.
-        
-        Decision flow:
-        1. Strategy returns EVResult(action, ev, p_bot, p_mkt, edge, reason)
-        2. Only BUY if action == 'BUY' (meaning P_bot > P_mkt AND EV > min_threshold)
-        3. Size position using Kelly from (p_bot, p_mkt)
-        4. Execute paper or live trade
-        """
         if not self.polymarket:
             logger.error("No Polymarket client available")
             return
-        
-        # Fetch markets
+
         try:
             markets = self.polymarket.get_markets(limit=50)
         except Exception as e:
             logger.error(f"Failed to fetch markets: {e}")
             return
-        
+
         if not markets:
             logger.info("No markets found")
             return
-        
-        logger.info(f"📊 Analyzing {len(markets)} markets...")
+
+        opened_ids = {p.market_id for p in self.portfolio.positions.values()} if self.portfolio else set()
+
+        if self.market_filter:
+            filtered = []
+            for m in markets:
+                if m.id in opened_ids:
+                    continue
+                hours = m.days_to_resolution * 24
+                gate = self.market_filter.gate(
+                    hours_to_resolution=hours,
+                    liquidity=m.liquidity,
+                    volume_24h=m.volume_24h,
+                    best_bid=m.best_bid,
+                    best_ask=m.best_ask,
+                    market_age_days=m.market_age_days,
+                )
+                if gate.passed:
+                    m._duration_score = gate.duration_score
+                    filtered.append(m)
+            logger.info("🚧 " + self.market_filter.gate_count_summary(len(markets), len(filtered)))
+            markets = filtered
+        else:
+            markets = [m for m in markets if m.id not in opened_ids]
+
+        logger.info(f"📊 Analyzing {len(markets)} markets (post-filter)...")
         trades_executed = 0
         hold_count = 0
         no_edge_count = 0
-        
+
+        self.kelly_cache.clear_cycle()
+
         for market in markets:
             try:
-                if market.id in [p.market_id for p in self.portfolio.positions.values()]:
-                    continue
                 
                 market_data = {
                     'id': market.id,
@@ -352,7 +400,7 @@ class LunaTradingBot:
                         action=ev_result.action,
                         confidence=ev_result.p_bot,
                         market_score=ev_result.p_bot,
-                        kelly_fraction=LunaStrategy.kelly_fraction(ev_result.p_bot, ev_result.p_mkt),
+                        kelly_fraction=self._kelly_or_compute(market.id, ev_result.p_bot, ev_result.p_mkt),
                         recommended_side='YES' if ev_result.p_bot > ev_result.p_mkt else 'NO',
                         phase=self.phase,
                     )
@@ -434,7 +482,8 @@ class LunaTradingBot:
                     if size >= 1.0:
                         logger.info(f"🎯 BUY {side} — {market.name[:60]}")
                         logger.info(f"   Our {p_bot:.1%} vs Market {p_mkt:.1%} (edge: {ev_result.edge:+.1%})")
-                        logger.info(f"   EV: ${ev:+.4f} | Size: ${size:.2f} | Kelly: {LunaStrategy.kelly_fraction(p_bot, p_mkt):.1%}")
+                        kelly = self._kelly_or_compute(market.id, p_bot, p_mkt)
+                        logger.info(f"   EV: ${ev:+.4f} | Size: ${size:.2f} | Kelly: {kelly:.1%}")
                         logger.info(f"   Cost: ${c_total:.4f} | WinNet: ${w_net:.4f}")
                         logger.info(f"   Reason: {ev_result.reason}")
                         
@@ -479,6 +528,7 @@ class LunaTradingBot:
         
         logger.info(f"📝 PAPER: {side} ${size:.2f} @ ${price:.3f} | Cost: ${cost:.2f} | Potential: ${potential_pnl:.2f} ({expected_roi:.0f}%)")
         
+        kelly = self._kelly_or_compute(market.id, p_bot, p_mkt)
         self.portfolio.open_position(
             position_id=position_id,
             market_id=market.id,
@@ -486,10 +536,13 @@ class LunaTradingBot:
             side=side,
             entry_price=price,
             size=size,
-            kelly_fraction=LunaStrategy.kelly_fraction(p_bot, p_mkt),
+            kelly_fraction=kelly,
             market_score=p_bot,
             confidence=p_bot,
         )
+        
+        if self.price_service:
+            self.price_service.record_entry(market.id, price)
         
         self.risk_manager.record_trade(0, size)
         
@@ -503,7 +556,7 @@ class LunaTradingBot:
                 'price': price,
                 'confidence': p_bot,
                 'market_score': p_bot,
-                'kelly_fraction': LunaStrategy.kelly_fraction(p_bot, p_mkt),
+                'kelly_fraction': self._kelly_or_compute(market.id, p_bot, p_mkt),
                 'cost': cost,
                 'potential_return': potential_pnl,
                 'expected_roi': expected_roi,
@@ -522,10 +575,11 @@ class LunaTradingBot:
             )
             if result.get('success'):
                 order_id = result.get('order_id', f'live-{time.time()}')
+                kelly = self._kelly_or_compute(market.id, p_bot, p_mkt)
                 self.portfolio.open_position(
                     position_id=order_id, market_id=market.id, market_name=market.name,
                     side=side, entry_price=price, size=size,
-                    kelly_fraction=LunaStrategy.kelly_fraction(p_bot, p_mkt),
+                    kelly_fraction=kelly,
                     market_score=p_bot, confidence=p_bot,
                 )
                 self.risk_manager.record_trade(0, size)
@@ -548,23 +602,19 @@ class LunaTradingBot:
         market_prices = {}
         market_resolution = {}
         
-        if self.polymarket and self.polymarket.is_connected():
-            try:
-                # Fetch prices for all open position markets
-                for pos in self.portfolio.positions.values():
-                    # In real implementation, query CLOB orderbook or Gamma API
-                    # For now, use mock or existing data
-                    pass
-            except:
-                pass
+        if self.polymarket and self.polymarket.is_connected() and self.price_service:
+            position_ids = list(self.portfolio.positions.keys())
+            market_prices.update(self.price_service.get_batch(position_ids))
         
-        # Use simulated prices for paper trading
-        if self.paper_trading:
+        if self.paper_trading and not market_prices:
             for pid, pos in self.portfolio.positions.items():
-                # Simulate small price movement
-                import random
-                change = random.uniform(-0.02, 0.03)
-                market_prices[pos.market_id] = max(0.01, min(0.99, pos.entry_price + change))
+                if self.price_service:
+                    self.price_service.record_entry(pid, pos.entry_price)
+                    market_prices[pid] = self.price_service.get_price(pid)
+                else:
+                    import random
+                    change = random.uniform(-0.02, 0.03)
+                    market_prices[pos.market_id] = max(0.01, min(0.99, pos.entry_price + change))
         
         # Check lifecycle (TP/SL/Expiry)
         to_close = self.portfolio.check_lifecycle(market_prices, market_resolution)
@@ -677,6 +727,18 @@ class LunaTradingBot:
             self.risk_manager.capital = self.current_capital
             
             logger.info(f"   New limits: {self.PHASES[self.phase]['name']} — max {self.PHASES[self.phase]['max_position']*100:.0f}% position")
+
+    # ═══════════════════════════════════════════
+    # EFFICIENCY HELPERS
+    # ═══════════════════════════════════════════
+
+    def _kelly_or_compute(self, market_id: str, p_bot: float, p_mkt: float) -> float:
+        if self.kelly_cache:
+            result = self.kelly_cache.get_or_compute(
+                market_id, p_bot, p_mkt, LunaStrategy.kelly_fraction,
+            )
+            return result.fraction
+        return LunaStrategy.kelly_fraction(p_bot, p_mkt)
 
     # ═══════════════════════════════════════════
     # HEALTH & RISK
