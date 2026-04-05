@@ -34,6 +34,7 @@ try:
     from src.orderbook import OrderBookAnalyzer, OrderBookTracker
     from src.correlation import CorrelationEngine
     from src.news import NewsAnalyzer
+    from src.evolution import EvolutionEngine
     from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
@@ -104,6 +105,7 @@ class LunaTradingBot:
         self.enable_orderbook = os.getenv('ENABLE_ORDERBOOK', 'true').lower() == 'true'
         self.enable_correlation = os.getenv('ENABLE_CORRELATION', 'true').lower() == 'true'
         self.enable_news = os.getenv('ENABLE_NEWS', 'true').lower() == 'true'
+        self.enable_evolution = os.getenv('ENABLE_EVOLUTION', 'true').lower() == 'true'
         self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
@@ -191,6 +193,14 @@ class LunaTradingBot:
             if self.enable_news:
                 self.news_analyzer = NewsAnalyzer()
                 logger.info("📰 News Sentiment analyzer enabled")
+            
+            # Phase 3: Online Learning (Evolution)
+            self.evolution_engine = None
+            if self.enable_evolution:
+                self.evolution_engine = EvolutionEngine(db_path=self.db_path, strategy_instance=self.strategy)
+                logger.info("🧠 Evolution Engine enabled (Auto-tuning weights)")
+                # Push any existing evolved weights to strategy immediately
+                self.evolution_engine._apply_to_strategy()
             
             # Phase 4: Dashboard
             if self.enable_dashboard:
@@ -679,11 +689,14 @@ class LunaTradingBot:
                        f"PnL: {d['pnl_pct']:+.1f}% | {d['age_hours']:.1f}h | {d['state']}")
 
     def generate_daily_report(self):
-        """Generate daily evolution report"""
+        """Generate daily evolution report & RUN LEARNING CYCLE"""
         try:
-            if not self.memory:
-                return None
+            # 1. Evolution Analysis (Phase 3)
+            if self.evolution_engine:
+                self.evolution_engine.run_analysis(min_trades=10)
+                logger.info(f"🧠 EVOLUTION STATE:\n{self.evolution_engine.adjustment_report}")
             
+            # 2. Portfolio Stats
             summary = self.portfolio.get_portfolio_summary() if self.portfolio else {}
             stats = self.memory.get_trading_stats()
             
