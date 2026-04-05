@@ -35,6 +35,7 @@ try:
     from src.correlation import CorrelationEngine
     from src.news import NewsAnalyzer
     from src.evolution import EvolutionEngine
+    from src.compounding import CompoundingEngine
     from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
@@ -107,6 +108,7 @@ class LunaTradingBot:
         self.enable_news = os.getenv('ENABLE_NEWS', 'true').lower() == 'true'
         self.enable_evolution = os.getenv('ENABLE_EVOLUTION', 'true').lower() == 'true'
         self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
+        self.enable_compounding = os.getenv('ENABLE_COMPOUNDING', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
         # State
@@ -121,7 +123,7 @@ class LunaTradingBot:
         # Initialize everything
         self._init_all()
         
-        logger.info(f"🌙 Luna Bot Phase 3 Initialized")
+        logger.info(f"🌙 Luna Bot Phase 6 Initialized")
         logger.info(f"💰 Capital: ${self.current_capital:.2f} | Phase: {self.phase} ({self.PHASES[self.phase]['name']})")
         logger.info(f"📊 Mode: {'📝 PAPER TRADING' if self.paper_trading else '🔴 LIVE TRADING'}")
         logger.info(f"⏱️ Check interval: {self.check_interval}m | Max daily loss: {self.max_daily_loss_pct*100:.0f}%")
@@ -201,6 +203,16 @@ class LunaTradingBot:
                 logger.info("🧠 Evolution Engine enabled (Auto-tuning weights)")
                 # Push any existing evolved weights to strategy immediately
                 self.evolution_engine._apply_to_strategy()
+            
+            # Phase 6: Compounding Protocol
+            self.compounding = None
+            if self.enable_compounding:
+                self.compounding = CompoundingEngine(
+                    fractional_constant=float(os.getenv('KELLY_FRACTION', 0.25)),
+                    max_position_pct=self.PHASES[self.phase]['max_position'],
+                    min_profit_offload=float(os.getenv('MIN_PROFIT_OFFLOAD', 0.10))
+                )
+                logger.info(f"📈 Compounding Protocol enabled (Quarter Kelly, {self.PHASES[self.phase]['max_position']*100:.0f}% max)")
             
             # Phase 4: Dashboard
             if self.enable_dashboard:
@@ -554,8 +566,47 @@ class LunaTradingBot:
                 change = random.uniform(-0.02, 0.03)
                 market_prices[pos.market_id] = max(0.01, min(0.99, pos.entry_price + change))
         
-        # Check lifecycle
+        # Check lifecycle (TP/SL/Expiry)
         to_close = self.portfolio.check_lifecycle(market_prices, market_resolution)
+        
+        # Phase 6: Risk Offloading check — sell before binary resolution
+        if self.compounding and self.portfolio.positions:
+            positions_snapshot = list(self.portfolio.positions.items())
+            for pos_id, pos in positions_snapshot:
+                if pos_id in [tc[0] for tc in to_close]:
+                    continue  # Already being closed
+                
+                # Calculate hours to resolution
+                hours_left = float('inf')
+                res_info = market_resolution.get(pos.market_id, {})
+                res_str = res_info.get('end_date_iso', '')
+                if res_str:
+                    try:
+                        from datetime import timezone
+                        res_date = datetime.fromisoformat(res_str.replace("Z", "+00:00"))
+                        hours_left = (res_date - datetime.now(res_date.tzinfo)).total_seconds() / 3600
+                    except:
+                        pass
+                
+                # Use days_to_resolution as fallback
+                if hours_left == float('inf') and hasattr(pos, 'age_minutes'):
+                    # Estimate from position age — rough fallback
+                    pass
+                
+                current_price = market_prices.get(pos.market_id, pos.entry_price)
+                
+                should_offload, offload_reason = self.compounding.check_offload(
+                    entry_price=pos.entry_price,
+                    current_price=current_price,
+                    p_bot_entry=pos.market_score,
+                    p_mkt_current=current_price,
+                    hours_to_resolution=hours_left,
+                    side=pos.side
+                )
+                
+                if should_offload:
+                    logger.info(f"📦 Risk Offload: {pos.market_name[:40]} — {offload_reason}")
+                    to_close.append((pos_id, f"Risk Offload: {offload_reason}", current_price))
         
         for position_id, reason, exit_price in to_close:
             logger.info(f"🔄 Auto-close: {position_id} — {reason} @ ${exit_price:.3f}")

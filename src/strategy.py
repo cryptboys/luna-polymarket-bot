@@ -321,36 +321,44 @@ class LunaStrategy:
     # ═══════════════════════════════════════════
     
     @staticmethod
-    def kelly_fraction(p_bot: float, p_mkt: float) -> float:
+    def kelly_fraction(p_bot: float, p_mkt: float, fractional_constant: float = 0.25) -> float:
         """
-        Kelly Criterion: f* = (bp - q) / b
+        Phase 6: EXACT Fractional Kelly Criterion
         
-        b = (1 - P_mkt) / P_mkt  (payout ratio for YES bet)
-        p = P_bot (our estimated probability)
-        q = 1 - p
+        f = c × ((p × b - q) / b)
         
-        Half-Kelly, capped at 25%.
+        Where:
+          c = fractional constant (0.25 = quarter Kelly for safety)
+          p = P_bot (our estimated probability)
+          q = 1 - p (probability of losing)
+          b = (1 - P_mkt) / P_mkt (payout ratio for YES bet)
+        
+        Half-Kelly fallback, capped at 15%.
         Returns 0.0 if no edge.
         """
         if p_bot <= p_mkt:
             return 0.0  # No edge — don't bet
         
-        if p_mkt <= 0 or p_mkt >= 1:
-            return 0.0
+        if p_mkt <= 0.01 or p_mkt >= 0.99:
+            return 0.0  # Too extreme, odds unreliable
         
         p = p_bot
-        q = 1 - p
-        b = (1 - p_mkt) / p_mkt
+        q = 1.0 - p
+        b = (1.0 - p_mkt) / p_mkt  # Payout ratio for YES bet
         
         if b <= 0:
             return 0.0
         
-        kelly = (b * p - q) / b
+        # EXACT FORMULA: f = c × ((p × b - q) / b)
+        raw_kelly = (p * b - q) / b
         
-        # Half-Kelly for safety
-        half_kelly = kelly / 2
+        if raw_kelly <= 0:
+            return 0.0
         
-        return max(0.0, min(0.25, half_kelly))
+        # Apply fractional constant (default 0.25 = quarter Kelly)
+        fractional = fractional_constant * raw_kelly
+        
+        return max(0.0, min(0.15, fractional))
     
     # ═══════════════════════════════════════════
     # PHASE THRESHOLDS
