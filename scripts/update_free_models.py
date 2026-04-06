@@ -1,127 +1,150 @@
-# Weekly Free Model Selector
-# Queries OpenRouter API, finds available free models, updates llm_router.py
-import os
+#!/usr/bin/env python3
+"""
+Luna Polymarket Free Model Auto-Updater — Every 3 Days
+Query OpenRouter, quality-rank free models, pick top 5.
+Update llm_router.py with new model list.
+"""
+import requests
 import json
-import re
-import logging
+import sys
+import os
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+LUNA_DIR = os.path.join(os.path.expanduser("~"), "luna-polymarket-bot")
+ROUTER_PATH = os.path.join(LUNA_DIR, "src", "llm_router.py")
 
-PREFERRED_FREE_ORDER = [
-    ("qwen/qwen3-235b-a22b", 10),
-    ("qwen/qwen-2.5-72b-instruct", 9),
-    ("meta-llama/llama-3.3-70b-instruct", 9),
-    ("google/gemini-2.0-flash-lite-preview-02-20", 8),
-    ("google/gemini-flash-1.5-8b", 7),
-    ("nousresearch/hermes-3-llama-3.1-405b", 8),
-    ("meta-llama/llama-3.1-405b-instruct", 8),
-    ("qwen/qwen3-14b", 6),
-    ("google/gemma-2-27b", 6),
-    ("mistralai/mistral-small-3.1-24b-instruct", 7),
+# Known good models ranked by reasoning quality
+PRIORITY_MODELS = [
+    "qwen/qwen3-235b-a22b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "google/gemini-2.0-flash:free",
+    "google/gemini-2.0-flash-lite:free",
+    "deepseek/deepseek-chat-v3-0324:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "openai/gpt-4o-mini:free",
+    "anthropic/claude-3.5-haulette-20241022:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemma-2-27b-it:free",
 ]
 
+# Paid fallback — only if all free exhausted
+FALLBACK_MODEL = "qwen/qwen3.5-flash-02-23"
 
 def fetch_free_models():
-    """Query OpenRouter for all currently available free models"""
-    import requests
-    resp = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    models = data.get("data", [])
+    """Get all free models from OpenRouter."""
+    try:
+        resp = requests.get("https://openrouter.ai/api/v1/models", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"API fetch failed: {e}", file=sys.stderr)
+        return []
+    
+    free = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        if mid.endswith(":free"):
+            pricing = m.get("pricing", {})
+            free.append({
+                "id": mid,
+                "name": m.get("name", ""),
+                "context": m.get("context_length", 0),
+                "prompt_price": float(pricing.get("prompt", 0)),
+                "completion_price": float(pricing.get("completion", 0)),
+            })
+    return free
 
-    free_models = []
-    for m in models:
-        model_id = m.get("id", "")
-        pricing = m.get("pricing", {})
-        is_free = model_id.endswith(":free") or (
-            all(float(v) == 0 for v in pricing.values()) if pricing else False
-        )
-        if is_free and not model_id.endswith(":free"):
-            model_id = f"{model_id}:free"
+def score_model(m):
+    """Score a model by quality."""
+    score = 0
+    mid = m["id"].lower()
+    full_id = m["id"]
+    
+    # Priority boost
+    if full_id in PRIORITY_MODELS:
+        score += 10 - PRIORITY_MODELS.index(full_id)
+    
+    # Context length bonus
+    if m["context"] >= 128000: score += 3
+    elif m["context"] >= 32000: score += 2
+    elif m["context"] >= 8000: score += 1
+    
+    # Name heuristic
+    if "qwen3" in mid or "qwen3.6" in mid: score += 4
+    if "llama" in mid: score += 3
+    if "gemini" in mid: score += 2
+    if "hermes" in mid: score += 2
+    if "claude" in mid: score += 3
+    if "deepseek" in mid: score += 2
+    
+    return score
 
-        context = m.get("context_length", 0)
-        free_models.append({
-            "id": model_id,
-            "name": m.get("name", ""),
-            "context": context,
-        })
-    return free_models
-
-
-def select_best_available(all_free, max_models=5):
-    """Pick best available free models based on preferred list"""
-    available_ids = {m["id"] for m in all_free}
-
-    selected = []
-    remaining = []
-    for model_id, priority in PREFERRED_FREE_ORDER:
-        if len(selected) >= max_models:
-            break
-        free_id = f"{model_id}:free" if not model_id.endswith(":free") else model_id
-        if free_id in available_ids:
-            selected.append(free_id)
-        else:
-            remaining.append((model_id, priority))
-
-    if len(selected) < max_models:
-        for m in all_free:
-            if len(selected) >= max_models:
-                break
-            if m["id"] not in selected:
-                selected.append(m["id"])
-
-    return selected
-
-
-def update_llm_router(selected_models):
-    """Rewrite FREE_MODELS list in llm_router.py"""
-    path = os.path.join(os.path.dirname(__file__), "llm_router.py")
-
-    with open(path, "r") as f:
+def update_router(top5):
+    """Update llm_router.py with new model list."""
+    if not os.path.exists(ROUTER_PATH):
+        print(f"Router not found at {ROUTER_PATH}", file=sys.stderr)
+        return False
+    
+    with open(ROUTER_PATH, 'r') as f:
         content = f.read()
+    
+    # Backup
+    backup_path = ROUTER_PATH + ".bak"
+    with open(backup_path, 'w') as f:
+        f.write(content)
+    
+    # Replace FREE_MODELS list
+    new_list = '\n'.join([f'    "{mid}",' for mid in top5])
+    
+    # Find and replace the FREE_MODELS list
+    import re
+    pattern = r'FREE_MODELS = \[[\s\S]*?\]'
+    
+    replacement = f'FREE_MODELS = [\n{new_list}\n]'
+    
+    content = re.sub(pattern, replacement, content)
+    
+    with open(ROUTER_PATH, 'w') as f:
+        f.write(content)
+    
+    return True
 
-    lines = ",\n".join(f'    "{m}"' for m in selected_models)
-    new_list = f"FREE_MODELS = [\n{lines},\n]"
-
-    pattern = r"FREE_MODELS\s*=\s*\[[\s\S]*?\]"
-    updated = re.sub(pattern, new_list, content, count=1)
-
-    with open(path, "w") as f:
-        f.write(updated)
-
-    return path
-
-
-def run():
-    logger.info("Fetching available free models from OpenRouter...")
-    all_free = fetch_free_models()
-    logger.info(f"Found {len(all_free)} free models")
-
-    selected = select_best_available(all_free, max_models=5)
-    logger.info(f"Selected {len(selected)} best free models:")
-    for m in selected:
-        logger.info(f"  ✓ {m}")
-
-    path = update_llm_router(selected)
-    logger.info(f"Updated {path}")
-
-    # Reset llm_router module if already loaded
-    import importlib
-    import sys
-    key = "src.llm_router" if "src.llm_router" in sys.modules else "llm_router"
-    if key in sys.modules:
-        importlib.reload(sys.modules[key])
-        import src.llm_router as lr
+def main():
+    print(f"[{datetime.now().isoformat()}] Fetching free models from OpenRouter...")
+    free_models = fetch_free_models()
+    
+    if not free_models:
+        print("ERROR: No free models found")
+        sys.exit(1)
+    
+    print(f"Found {len(free_models)} free models")
+    
+    # Score and sort
+    scored = [(m, score_model(m)) for m in free_models]
+    scored.sort(key=lambda x: -x[1])
+    
+    # Top 5
+    top5 = [m["id"] for m, s in scored[:5]]
+    
+    print(f"\n=== TOP 5 FREE MODELS (Quality Ranked) ===")
+    for i, (m, s) in enumerate(scored[:20], 1):
+        ctx = m["context"]
+        ctx_str = f"{ctx//1000}k" if ctx else "?"
+        print(f"  [{i:2d}] {s:3d}pts | {m['id']} | ctx={ctx_str}")
+    
+    print(f"\n=== AUTO-SELECTION (Top 5) ===")
+    for i, mid in enumerate(top5, 1):
+        print(f"  {i}. {mid}")
+    print(f"\n  Fallback (paid): {FALLBACK_MODEL}")
+    
+    # Update router
+    if update_router(top5):
+        print(f"\n✅ LLM Router updated successfully")
+        print(f"   Models: {', '.join(top5)}")
     else:
-        from src import llm_router as lr
-
-    if hasattr(lr, "_router") and lr._router:
-        lr._router._models = list(selected)
-        lr.get_llm_router()._models = list(selected)
-        lr.get_llm_router()._blocked_until.clear()
-
-    return selected
-
+        print(f"\n❌ Failed to update LLM Router")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    run()
+    main()

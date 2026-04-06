@@ -8,14 +8,14 @@ logger = logging.getLogger(__name__)
 
 # Free models ordered by quality (best → good)
 FREE_MODELS = [
-    "qwen/qwen3-235b-a22b:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-lite-preview-02-20:free",
-    "google/gemini-flash-1.5-8b:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",  # Top reasoning (18pts)
+    "meta-llama/llama-3.3-70b-instruct:free",     # Best screening (16pts)
+    "qwen/qwen3.6-plus:free",                     # Best general (11pts)
+    "qwen/qwen3-next-80b-a3b-instruct:free",      # Strong mid-tier (9pts)
+    "qwen/qwen3-coder:free",                      # Backup (6pts)
 ]
 
-FALLBACK_MODEL = "qwen/qwen3.5-flash-02-23"
+FALLBACK_MODEL = "qwen/qwen3.5-flash-02-23"  # PAID — ONLY if all 5 free models return 429
 
 
 class LLMError(Exception):

@@ -175,22 +175,53 @@ class PolymarketClient:
     def _parse_market_from_gamma(self, data: Dict) -> Optional[Market]:
         """Parse market from Gamma API response"""
         try:
-            condition_id = data.get("condition_id", "")
+            # Gamma API uses camelCase — map to our field names
+            condition_id = data.get("conditionId", data.get("condition_id", ""))
             outcomes = data.get("outcomes", [])
-            outcome_prices = data.get("outcomePrices", {})
-            if isinstance(outcome_prices, dict):
-                outcome_prices = {k: float(v) for k, v in outcome_prices.items()}
+            outcome_prices_raw = data.get("outcomePrices", data.get("outcome_prices", {}))
+            outcome_prices = {}
+
+            # Handle various formats: JSON string, list, or dict
+            if isinstance(outcome_prices_raw, str):
+                # Try parsing as JSON first
+                try:
+                    import json
+                    parsed = json.loads(outcome_prices_raw)
+                    if isinstance(parsed, list):
+                        outcome_prices_raw = parsed  # Now it's a real list
+                    elif isinstance(parsed, dict):
+                        outcome_prices = {k: float(v) for k, v in parsed.items()}
+                        outcome_prices_raw = []
+                    else:
+                        outcome_prices_raw = {}
+                except:
+                    outcome_prices_raw = {}
+
+            if isinstance(outcome_prices_raw, list) and len(outcome_prices_raw) > 0:
+                # ["0.65", "0.35"] → {"Yes": 0.65, "No": 0.35}
+                for i, val in enumerate(outcome_prices_raw):
+                    key = outcomes[i] if i < len(outcomes) else str(i)
+                    outcome_prices[key] = float(val)
             
-            # Get best bid/ask from CLOB if available
+            # Extract raw metrics early (needed for synthetic spread calculation)
+            volume_24h = float(data.get("volume24hr", 0))
+            liquidity = float(data.get("liquidity", 0))
+            
+            # Get best bid/ask for YES outcome (primary trading instrument)
+            # In binary markets: YES price = p, NO price = 1-p
+            # Bid/ask spread from outcomePrices is the round-trip cost
+            # For YES: bid = YES price - spread/2, ask = YES price + spread/2
+            # Since Gamma doesn't give orderbook data here, approximate:
             best_bid = 0.0
             best_ask = 1.0
             if outcome_prices and len(outcome_prices) > 0:
                 prices = list(outcome_prices.values())
-                best_bid = min(prices) if prices else 0.0
-                best_ask = max(prices) if prices else 1.0
-            
-            volume_24h = float(data.get("volume24hr", 0))
-            liquidity = float(data.get("liquidity", 0))
+                yes_price = prices[0] if prices else 0.5  # First outcome is YES
+                # Approximate bid-ask: spread ~ 1-2 bps for liquid, higher for thin
+                # For market_filter purposes: use mid-price with small synthetic spread
+                synthetic_spread = max(0.002, 1.0 / max(liquidity, 100))  # min 20bps, scales with liquidity
+                best_bid = max(0.0, yes_price - synthetic_spread / 2)
+                best_ask = min(1.0, yes_price + synthetic_spread / 2)
             
             # Calculate days to resolution
             end_date = data.get("endDateIso", "")

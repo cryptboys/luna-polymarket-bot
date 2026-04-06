@@ -24,10 +24,10 @@ class GateResult(NamedTuple):
 
 @dataclass
 class MarketFilterConfig:
-    max_duration_hours: int = 168
-    min_liquidity: float = 5000.0
-    min_volume_24h: float = 1000.0
-    max_spread_bps: int = 200
+    max_duration_hours: int = 720   # 30 days (lebih fleksibel untuk paper trade)
+    min_liquidity: float = 1000.0   # dari 5000 → cukup untuk $5 modal
+    min_volume_24h: float = 500.0   # dari 1000 → cari market aktif tapi nggak terlalu ketat
+    max_spread_bps: int = 500       # dari 200 (2%) → 5% (lebih toleran)
 
 
 class MarketFilter:

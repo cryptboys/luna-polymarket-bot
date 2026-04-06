@@ -25,6 +25,11 @@ def _ensure_dirs():
 
 DATA_DIR, LOGS_DIR = _ensure_dirs()
 
+# Add project root to Python path (works from any directory)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 # Import modules
 try:
     from src.polymarket import PolymarketClient, OrderManager, Market
@@ -38,12 +43,14 @@ try:
     from src.compounding import CompoundingEngine
     from src.market_filter import MarketFilter, MarketFilterConfig
     from src.price_service import PriceService, GammaPriceProvider, PaperPriceProvider
+    from src.telegram_notifier import TelegramNotifier
     from src.kelly_cache import KellyCache
     from src.pnl import PnlCalculator
     from src.rate_limiter import ApiRateLimiter
     from src.llm_router import LlmRouter, llm_analyze
     from src.backtest import Backtester
     from src.dashboard import start_dashboard
+    from src.ml_boost import MLBoost
     MODULES_LOADED = True
 except ImportError as e:
     MODULES_LOADED = False
@@ -90,8 +97,8 @@ class LunaTradingBot:
         self.last_reset = datetime.now().date()
         
         # Trading config
-        self.check_interval = int(os.getenv('CHECK_INTERVAL_MINUTES', 5))
-        self.min_liquidity = float(os.getenv('MIN_LIQUIDITY', 10000))
+        self.check_interval = int(os.getenv('CHECK_INTERVAL_MINUTES', 15))
+        self.min_liquidity = float(os.getenv('MIN_LIQUIDITY', 1000))
         
         # Paper trading mode
         self.paper_trading = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
@@ -118,6 +125,7 @@ class LunaTradingBot:
         self.enable_compounding = os.getenv('ENABLE_COMPOUNDING', 'true').lower() == 'true'
         self.enable_llm = os.getenv('ENABLE_LLM', 'true').lower() == 'true'
         self.enable_market_filter = os.getenv('ENABLE_MARKET_FILTER', 'true').lower() == 'true'
+        self.enable_ml_boost = os.getenv('ENABLE_ML_BOOST', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
         # State
@@ -227,12 +235,12 @@ class LunaTradingBot:
             self.market_filter = None
             if self.enable_market_filter:
                 self.market_filter = MarketFilter(MarketFilterConfig(
-                    max_duration_hours=int(os.getenv('MAX_DURATION_HOURS', 168)),
+                    max_duration_hours=int(os.getenv('MAX_DURATION_HOURS', 720)),
                     min_liquidity=self.min_liquidity,
-                    min_volume_24h=float(os.getenv('MIN_VOLUME_24H', 1000)),
-                    max_spread_bps=int(os.getenv('MAX_SPREAD_BPS', 200)),
+                    min_volume_24h=float(os.getenv('MIN_VOLUME_24H', 500)),
+                    max_spread_bps=int(os.getenv('MAX_SPREAD_BPS', 500)),
                 ))
-                logger.info(f"🚧 Market Filter enabled (max {int(os.getenv('MAX_DURATION_HOURS', 168))}h duration)")
+                logger.info(f"🚧 Market Filter enabled (max {int(os.getenv('MAX_DURATION_HOURS', 720))}h duration)")
 
             # Efficiency: Price Service
             self.price_service = None
@@ -260,6 +268,19 @@ class LunaTradingBot:
                     logger.info("🧠 LLM Router: 4 free models + qwen3.5-flash fallback")
                 except Exception as e:
                     logger.warning(f"LLM Router init failed: {e}")
+
+            # Phase 7: ML Boost (confidence enhancer, not replacement)
+            self.ml_boost = None
+            if self.enable_ml_boost:
+                try:
+                    self.ml_boost = MLBoost(db_memory=self.memory)
+                    status = self.ml_boost.get_status()
+                    if status['ready']:
+                        logger.info(f"🤖 ML Boost loaded | Accuracy: {status['accuracy']:.1%} | Weight: {status['weight']:.2f}")
+                    else:
+                        logger.info(f"🤖 ML Boost initialized (cold start — collecting data)")
+                except Exception as e:
+                    logger.warning(f"ML Boost init failed: {e}")
 
             # Phase 4: Dashboard
             if self.enable_dashboard:
@@ -447,6 +468,55 @@ class LunaTradingBot:
                 c_total = p_mkt + (spread * 0.5)
                 w_net = 1.0 - c_total
                 ev = (p_bot * w_net) - ((1 - p_bot) * c_total)
+                
+                # ═══════════════════════════════════════════
+                # ML BOOST — Phase 7: Confidence enhancement
+                # Rule-based tetap primary, ML hanya ±0.03 adjustment
+                # Cold start: weight = 0 (belum ada data)
+                # ═══════════════════════════════════════════
+                if self.ml_boost and ev_result.action == 'BUY':
+                    try:
+                        ml_features = {
+                            'sentiment_score': market_data.get('sentiment_score', 0.5),
+                            'volume_24h': market_data.get('volume_24h', 0),
+                            'price_mid': p_mkt,
+                            'spread_pct': spread / p_mkt if p_mkt > 0 else 0.01,
+                            'liquidity': market_data.get('liquidity', 0),
+                            'time_to_resolution_hours': market_data.get('days_to_resolution', 7) * 24,
+                            'market_age_hours': market_data.get('market_age_days', 1) * 24,
+                            'category_risk': self.strategy._score_category(market.category),
+                        }
+                        
+                        ml_result = self.ml_boost.predict(ml_features)
+                        
+                        if ml_result['ml_ready']:
+                            # Apply ML adjustment to p_bot (confidence)
+                            old_p_bot = p_bot
+                            p_bot = max(0.01, min(0.99, p_bot + ml_result['ml_adjustment']))
+                            
+                            direction = "🤖↑" if ml_result['ml_adjustment'] > 0 else "🤖↓"
+                            logger.info(
+                                f"{direction} ML Boost: {old_p_bot:.1%} → {p_bot:.1%} "
+                                f"(adj: {ml_result['ml_adjustment']:+.3f}, weight: {ml_result['weight']:.2f})"
+                            )
+                            
+                            # Re-calculate EV with adjusted confidence
+                            ev = (p_bot * w_net) - ((1 - p_bot) * c_total)
+                            
+                            # Record trade features for future training
+                            self.ml_boost.record_trade(market.id, ml_features, outcome=None)
+                        else:
+                            # Cold start — just record features, no adjustment
+                            ml_direction = "🤖⏸"
+                            logger.debug(f"{ml_direction} ML Boost cold start — collecting data only")
+                            self.ml_boost.record_trade(market.id, ml_features, outcome=None)
+                    except Exception as e:
+                        logger.debug(f"ML Boost skipped: {e}")
+                
+                # Re-check EV after all adjustments — reject if now negative
+                if ev < 0:
+                    logger.debug(f"ML/OrderBook adjustment made EV negative — rejecting trade on {market.slug}")
+                    continue
                 
                 # ═══════════════════════════════════════════
                 # CORRELATION CHECK
