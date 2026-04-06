@@ -41,6 +41,7 @@ try:
     from src.kelly_cache import KellyCache
     from src.pnl import PnlCalculator
     from src.rate_limiter import ApiRateLimiter
+    from src.llm_router import LlmRouter, llm_analyze
     from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
@@ -114,6 +115,7 @@ class LunaTradingBot:
         self.enable_evolution = os.getenv('ENABLE_EVOLUTION', 'true').lower() == 'true'
         self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
         self.enable_compounding = os.getenv('ENABLE_COMPOUNDING', 'true').lower() == 'true'
+        self.enable_llm = os.getenv('ENABLE_LLM', 'true').lower() == 'true'
         self.enable_market_filter = os.getenv('ENABLE_MARKET_FILTER', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', 8080))
         
@@ -247,7 +249,17 @@ class LunaTradingBot:
 
             # Efficiency: Rate Limiter
             self.rate_limiter = ApiRateLimiter()
-            
+
+            # LLM: Multi-model router (free models primary, qwen3.5-flash fallback)
+            self.enable_llm = os.getenv('ENABLE_LLM', 'true').lower() == 'true'
+            self.llm_router = None
+            if self.enable_llm:
+                try:
+                    self.llm_router = LlmRouter()
+                    logger.info("🧠 LLM Router: 4 free models + qwen3.5-flash fallback")
+                except Exception as e:
+                    logger.warning(f"LLM Router init failed: {e}")
+
             # Phase 4: Dashboard
             if self.enable_dashboard:
                 import threading
@@ -472,6 +484,37 @@ class LunaTradingBot:
                     except Exception as e:
                         logger.debug(f"News analysis skipped: {e}")
                 
+                # ═══════════════════════════════════════════
+                # LLM CONTEXT VALIDATION (borderline cases)
+                # ═══════════════════════════════════════════
+                if ev_result.action == 'BUY' and self.llm_router and 0.01 < ev < 0.05:
+                    try:
+                        llm_prompt = (
+                            f"Market: {market.name}\n"
+                            f"Category: {market.category}\n"
+                            f"Our probability: {p_bot:.1%}\n"
+                            f"Market probability: {p_mkt:.1%}\n"
+                            f"Expected Value: ${ev:+.4f}\n"
+                            f"Edge: {p_bot - p_mkt:+.1%}\n"
+                            f"Liquidity: ${market.liquidity:,.0f}\n"
+                            f"Volume 24h: ${market.volume_24h:,.0f}\n\n"
+                            f"Question: Is this a legitimate edge or does market structure "
+                            f"suggest the edge is artificial? Reply CONCISE (YES/NO + 1 sentence reason)."
+                        )
+                        llm_result = self.llm_router.call(
+                            "You are a prediction market analyst. Evaluate whether a market edge is real or artificial.",
+                            llm_prompt,
+                            max_tokens=128,
+                            temperature=0.2,
+                        )
+                        if 'NO' in llm_result.upper()[:30]:
+                            logger.info(f"🧠 LLM veto: {llm_result}")
+                            ev_result = EVResult('HOLD', ev, p_bot, p_mkt, p_bot - p_mkt, f"LLM veto: {llm_result}")
+                        else:
+                            logger.info(f"🧠 LLM confirm: {llm_result}")
+                    except Exception as e:
+                        logger.debug(f"LLM validation skipped: {e}")
+
                 # ═══════════════════════════════════════════
                 # EXECUTION DECISION
                 # ═══════════════════════════════════════════
