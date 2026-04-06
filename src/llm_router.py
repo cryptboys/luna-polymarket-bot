@@ -1,79 +1,78 @@
-# LLM Router — Multi-model with automatic fallback
-# Primary: free models → Fallback: qwen3.5-flash on rate limit/error
+# LLM Router — Free models primary, qwen3.5-flash ONLY when all free models exhausted
 
 import os
 import time
-import json
 import logging
 
 logger = logging.getLogger(__name__)
 
+# Free models ordered by quality (best → good)
 FREE_MODELS = [
-    "qwen/qwen-2.5-72b-instruct:free",
+    "qwen/qwen3-235b-a22b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemini-2.0-flash-lite-preview-02-20:free",
     "google/gemini-flash-1.5-8b:free",
     "nousresearch/hermes-3-llama-3.1-405b:free",
 ]
 
 FALLBACK_MODEL = "qwen/qwen3.5-flash-02-23"
 
+
 class LLMError(Exception):
     pass
+
 
 class RateLimitError(LLMError):
     pass
 
+
 class LlmRouter:
     def __init__(self):
-        self._model_order = list(FREE_MODELS)
+        self._models = list(FREE_MODELS)
         self._fallback = FALLBACK_MODEL
         self._base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         self._api_key = os.getenv("OPENROUTER_API_KEY", "")
-        self._failure_counts = {}
-        self._retry_after = {}
-        self._current_primary_idx = 0
-        self._call_count = 0
-        self._fail_count = 0
+        self._blocked_until = {}
+        self._idx = 0
+        self._calls = 0
+        self._fallbacks_used = 0
 
-    def call(
-        self,
-        system_prompt,
-        user_prompt,
-        max_tokens=512,
-        temperature=0.3,
-    ) -> str:
-        self._call_count += 1
-        last_error = None
+    def call(self, system, user, max_tokens=256, temperature=0.2) -> str:
+        self._calls += 1
+        last_err = None
 
-        for attempt in range(2):
-            if attempt == 0:
-                model = self._select_primary()
-            else:
-                model = self._fallback
+        for _ in range(len(self._models)):
+            model = self._models[self._idx % len(self._models)]
+            self._idx += 1
 
-            if model in self._retry_after and time.time() < self._retry_after[model]:
+            if self._is_blocked(model):
                 continue
 
             try:
-                result = self._do_request(model, system_prompt, user_prompt, max_tokens, temperature)
-                self._record_success(model)
+                result = self._request(model, system, user, max_tokens, temperature)
                 return result
-            except RateLimitError as e:
-                self._record_rate_limit(model)
-                last_error = e
-                logger.warning(f"Rate limited on {model.split('/')[-1]}, trying next")
+            except RateLimitError:
+                last_err = None
+                logger.debug(f"Free rate-lim {model.split('/')[-1]}")
             except Exception as e:
-                self._record_failure(model)
-                last_error = e
-                logger.warning(f"Error on {model.split('/')[-1]}: {e}")
+                last_err = e
+                logger.warning(f"Free err {model.split('/')[-1]}: {e}")
+
+        if not self._fallback_used_recently():
+            self._fallbacks_used += 1
+            logger.warning(f"All free exhausted, using paid fallback: {self._fallback.split('/')[-1]}")
+            try:
+                return self._request(self._fallback, system, user, max_tokens, temperature)
+            except Exception as e:
+                last_err = e
 
         raise LLMError(
-            f"All models failed (primary + fallback). "
-            f"Last error: {last_error}. Calls:{self._call_count} Fails:{self._fail_count}"
+            f"All models failed ({len(self._models)} free + 1 paid). Last: {last_err}"
         )
 
-    def _do_request(self, model, system_prompt, user_prompt, max_tokens, temperature):
+    def _request(self, model, system, user, max_tokens, temperature):
         import requests
+
         url = f"{self._base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -84,60 +83,51 @@ class LlmRouter:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
-        
+
         if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 60))
-            self._retry_after[model] = time.time() + retry_after
-            raise RateLimitError(f"Rate limited: {retry_after}s")
-        
+            retry = int(resp.headers.get("Retry-After", 120))
+            self._blocked_until[model] = time.time() + retry
+            raise RateLimitError()
+
         if resp.status_code >= 400:
+            self._blocked_until[model] = time.time() + 300
             raise LLMError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-        
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
 
-    def _select_primary(self) -> str:
-        for i in range(len(self._model_order)):
-            idx = (self._current_primary_idx + i) % len(self._model_order)
-            model = self._model_order[idx]
-            if model not in self._retry_after or time.time() >= self._retry_after[model]:
-                self._current_primary_idx = (idx + 1) % len(self._model_order)
-                return model
-        return self._fallback
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
-    def _record_success(self, model):
-        self._failure_counts[model] = self._failure_counts.get(model, 0) * 0.9
-        if model in self._retry_after and time.time() >= self._retry_after[model]:
-            del self._retry_after[model]
+    def _is_blocked(self, model):
+        until = self._blocked_until.get(model)
+        if until is None:
+            return False
+        if time.time() < until:
+            return True
+        del self._blocked_until[model]
+        return False
 
-    def _record_failure(self, model):
-        self._failure_counts[model] = self._failure_counts.get(model, 0) + 1
-        self._fail_count += 1
-        if self._failure_counts.get(model, 0) >= 3:
-            self._retry_after[model] = time.time() + 300
+    def _fallback_used_recently(self):
+        until = self._blocked_until.get(self._fallback)
+        if until and time.time() < until:
+            return True
+        return False
 
-    def _record_rate_limit(self, model):
-        self._failure_counts[model] = self._failure_counts.get(model, 0) + 5
-        self._fail_count += 1
-
-    def stats(self) -> dict:
-        available = [m.split('/')[-1] for m in self._model_order if m not in self._retry_after]
+    def stats(self):
         return {
-            "calls": self._call_count,
-            "failures": self._fail_count,
-            "primary_available": available,
-            "primary_unavailable": [m.split('/')[-1] for m in self._model_order if m in self._retry_after],
+            "calls": self._calls,
+            "fallbacks": self._fallbacks_used,
+            "free_active": len([m for m in self._models if not self._is_blocked(m)]),
+            "free_blocked": len([m for m in self._models if self._is_blocked(m)]),
         }
 
-# Singleton
+
 _router = None
+
 
 def get_llm_router():
     global _router
@@ -145,5 +135,6 @@ def get_llm_router():
         _router = LlmRouter()
     return _router
 
-def llm_analyze(system_prompt, user_prompt, max_tokens=512, temperature=0.3):
-    return get_llm_router().call(system_prompt, user_prompt, max_tokens, temperature)
+
+def llm_analyze(system, user, max_tokens=256, temperature=0.2):
+    return get_llm_router().call(system, user, max_tokens, temperature)
