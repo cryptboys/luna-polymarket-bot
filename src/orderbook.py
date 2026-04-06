@@ -81,7 +81,26 @@ class OrderBookAnalyzer:
         self.client = polymarket_client
         self._cached_books: Dict[str, OrderBookAnalysis] = {}
         self._cache_ttl = 30  # seconds
-    
+
+    def batch_analyze(self, market_ids: List[str]) -> Dict[str, OrderBookAnalysis]:
+        """Analyze order books for multiple markets in one call"""
+        results = {}
+        to_fetch = []
+        for mid in market_ids:
+            cached = self._cached_books.get(mid)
+            if cached and (time.time() - cached.timestamp) < self._cache_ttl:
+                results[mid] = cached
+            else:
+                to_fetch.append(mid)
+        for mid in to_fetch:
+            try:
+                analysis = self.analyze(mid)
+                if analysis:
+                    results[mid] = analysis
+            except Exception:
+                pass
+        return results
+
     def analyze(self, market_id: str, token_id: str = None) -> Optional[OrderBookAnalysis]:
         """
         Fetch and analyze order book for a market.

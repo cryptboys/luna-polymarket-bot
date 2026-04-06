@@ -42,6 +42,7 @@ try:
     from src.pnl import PnlCalculator
     from src.rate_limiter import ApiRateLimiter
     from src.llm_router import LlmRouter, llm_analyze
+    from src.backtest import Backtester
     from src.dashboard import start_dashboard
     MODULES_LOADED = True
 except ImportError as e:
@@ -951,6 +952,25 @@ Keep compounding! 🌙"""
         """Graceful stop"""
         self._running = False
 
+
+    # ═══════════════════════════════════════════
+    # BACKTESTING
+    # ═══════════════════════════════════════════
+
+    def run_backtest(self, limit=50, category=None):
+        """Run backtest against historical resolved markets"""
+        import os
+        bt = Backtester(self.strategy, initial_capital=float(os.getenv('BACKTEST_CAPITAL', 100)))
+        logger.info(f"🧪 Fetching {limit} resolved markets{' in ' + category if category else ''}...")
+        markets = bt.fetch_resolved_markets(category=category, limit=limit)
+        logger.info(f"📥 Got {len(markets)} markets, running backtest...")
+        result = bt.run(markets)
+        report = bt.print_report(result)
+        logger.info(report)
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'backtest_result.json')
+        bt.save_results(result, path)
+        logger.info(f"💾 Results saved to {path}")
+        return result
 
 if __name__ == "__main__":
     try:
